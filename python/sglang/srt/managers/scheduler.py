@@ -1106,6 +1106,21 @@ class Scheduler(
             if disable_overlap_for_batch:
                 pop_and_process()
 
+            # current batch will deal with last batch's grammar accept tokens while current batch verifying in GPU
+            if (
+                batch
+                and batch.is_eagle_v2
+                and batch.has_grammar
+                and batch.forward_mode.is_decode()
+                and len(self.result_queue) > 0
+            ):
+                last_batch, last_result = self.result_queue[-1]
+                # here batch is copied, so has_grammar need also as a param
+                if last_batch.has_grammar:
+                    batch.last_batch_and_result = (last_batch, last_result)
+                    # Mark that grammar accept will be processed in the next batch's verify
+                    last_result.grammar_accept_processed = True
+
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
@@ -1144,15 +1159,15 @@ class Scheduler(
         # We do not support overlap + spec + grammar yet,
         # so we need to turn off overlap for this batch.
         # TODO(lsyin): support overlap + spec + grammar
-        need_grammar_sync = (
-            batch
-            and batch.is_eagle_v2
-            and batch.has_grammar
-            and batch.forward_mode.is_decode()
-            and len(self.result_queue) > 0
-        )
+        # need_grammar_sync = (
+        #     batch
+        #     and batch.is_eagle_v2
+        #     and batch.has_grammar
+        #     and batch.forward_mode.is_decode()
+        #     and len(self.result_queue) > 0
+        # )
 
-        return disable_overlap_for_batch or need_grammar_sync
+        return disable_overlap_for_batch
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:

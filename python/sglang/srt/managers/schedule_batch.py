@@ -1223,6 +1223,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+    # Store the last batch and result for speculative decoding
+    # Tuple[ScheduleBatch, GenerationBatchResult]
+    last_batch_and_result: Optional[Tuple[Any, Any]] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -2124,6 +2127,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            last_batch_and_result=self.last_batch_and_result,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2148,6 +2152,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
+            has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2233,6 +2238,8 @@ class ModelWorkerBatch:
     spec_algorithm: SpeculativeAlgorithm = None
 
     spec_info: Optional[SpecInput] = None
+
+    last_batch_and_result: Optional[Tuple[Any, Any]] = None
 
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None

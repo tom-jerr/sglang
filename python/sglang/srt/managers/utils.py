@@ -37,6 +37,8 @@ class GenerationBatchResult:
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
+    # For speculative decoding + Constrained Decoding
+    grammar_accept_processed: bool = False
 
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
