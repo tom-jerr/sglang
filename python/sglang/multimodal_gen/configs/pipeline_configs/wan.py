@@ -204,9 +204,72 @@ class Wan2_2_I2V_A14B_Config(WanI2V480PConfig):
 class Wan2_2_Animate_14B_Config(WanI2V480PConfig):
     flow_shift: float | None = 5.0
     boundary_ratio: float | None = 0.900
+    refert_num: int = 1
+    clip_len: int = 77
+
+    def get_latent_video_length(self, num_frames: int) -> int:
+        return self.clip_len
+
+    def get_latent_extra_frames(self) -> int:
+        return 1
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Prepare positive conditioning kwargs for Wan Animate.
+
+        For positive pass, we use the actual pose_hidden_states and face_pixel_values.
+        Note: pose_hidden_states and face_pixel_values are already added in denoising.py,
+        this method is for any additional kwargs.
+        """
+        return {}
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Prepare negative conditioning kwargs for Wan Animate CFG.
+
+        For negative (unconditional) pass:
+        - pose_hidden_states: same as positive pass
+        - face_pixel_values: blank face (all pixels set to -1)
+
+        This matches diffusers implementation:
+        face_pixel_values_uncond = face_video_segment * 0 - 1
+        """
+        face_pixel_values = batch.extra.get("face_pixel_values")
+        pose_hidden_states = batch.extra.get("pose_hidden_states")
+
+        neg_kwargs = {}
+        if pose_hidden_states is not None:
+            neg_kwargs["pose_hidden_states"] = pose_hidden_states
+        if face_pixel_values is not None:
+            # Blank out face for unconditional guidance (set all pixels to -1)
+            face_pixel_values_uncond = face_pixel_values * 0 - 1
+            neg_kwargs["face_pixel_values"] = face_pixel_values_uncond
+
+        return neg_kwargs
 
     def post_denoising_loop(self, latents, batch):
-        return latents[:, :, 1:]
+        return latents[:, :, self.refert_num :]
+
+    def postprocess_decoded_frames(self, batch, frames):
+        print("Decoding stage: handling WanAnimate segment stitching.")
+        if batch.extra.get("all_frames") is None:
+            batch.extra["all_frames"] = frames
+        else:
+            batch.extra["all_frames"] = torch.cat(
+                (
+                    batch.extra.get("all_frames"),
+                    frames[:, :, self.refert_num :],
+                ),
+                dim=2,
+            )
+
+        if batch.extra.get("cur_segment") != batch.extra.get("num_segments") - 1:
+            batch.extra["cur_segment"] = batch.extra.get("cur_segment") + 1
+            batch.timesteps = None
+            batch.latents = None
+            return frames, batch
+
+        frames = batch.extra.get("all_frames")
+        frames = frames[:, :, : batch.extra["real_frame_len"]]
+        return frames, None
 
     def __post_init__(self) -> None:
         super().__post_init__()
