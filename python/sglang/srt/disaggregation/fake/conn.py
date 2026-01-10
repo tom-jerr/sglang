@@ -5,13 +5,35 @@ import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.base.conn import (
+    BaseKVBootstrapServer,
     BaseKVManager,
     BaseKVReceiver,
     BaseKVSender,
+    KVArgs,
     KVPoll,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+class FakeKVManager(BaseKVManager):
+    """Fake KV manager for testing PD disaggregation without RDMA hardware."""
+
+    def __init__(
+        self,
+        args: KVArgs,
+        disaggregation_mode: DisaggregationMode,
+        server_args: ServerArgs,
+        is_mla_backend: Optional[bool] = False,
+    ):
+        self.kv_args = args
+        self.is_mla_backend = is_mla_backend
+        self.disaggregation_mode = disaggregation_mode
+        logger.info(
+            f"FakeKVManager initialized for {disaggregation_mode} mode (no actual manager operations)"
+        )
 
 
 # For warmup reqs, we don't kv transfer, we use the fake sender and receiver
@@ -91,3 +113,14 @@ class FakeKVReceiver(BaseKVReceiver):
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
+
+
+class FakeKVBootstrapServer(BaseKVBootstrapServer):
+    """Fake bootstrap server for testing PD disaggregation without RDMA hardware."""
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        logger.info(
+            f"FakeKVBootstrapServer initialized at {host}:{port} (no actual server started)"
+        )
