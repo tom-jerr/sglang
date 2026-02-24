@@ -37,6 +37,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     WanT2V720PConfig,
     ZImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2KleinPipelineConfig,
@@ -97,6 +98,10 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanI2V_14B_720P_SamplingParam,
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.sana import (
+    SanaSamplingParams,
+    SanaTurboSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.zimage import (
     ZImageSamplingParams,
@@ -657,6 +662,19 @@ def _register_configs():
         sampling_param_cls=GlmImageSamplingParams,
         pipeline_config_cls=GlmImagePipelineConfig,
         model_detectors=[lambda hf_id: "glm-image" in hf_id.lower()],
+    )
+
+    # Sana
+    register_configs(
+        sampling_param_cls=SanaSamplingParams,
+        pipeline_config_cls=SanaPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/Sana_1600M_1024px_diffusers",
+            "Efficient-Large-Model/Sana_1600M_512px_diffusers",
+            "Efficient-Large-Model/Sana_600M_1024px_diffusers",
+            "Efficient-Large-Model/Sana_600M_512px_diffusers",
+        ],
+        model_detectors=[lambda hf_id: "sana" in hf_id.lower()],
     )
 
 

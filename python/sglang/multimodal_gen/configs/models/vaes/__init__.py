@@ -2,10 +2,12 @@
 
 from sglang.multimodal_gen.configs.models.vaes.dac import DacVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.hunyuanvae import HunyuanVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
 
 __all__ = [
     "DacVAEConfig",
     "HunyuanVAEConfig",
+    "SanaVAEConfig",
     "WanVAEConfig",
 ]
