@@ -270,6 +270,12 @@ class ServerArgs:
 
     disable_autocast: bool | None = None
 
+    # Async Stage Pipelining (Phase 1: Denoising internal optimization)
+    enable_denoising_pipeline: bool = True  # Enable CPU-GPU overlap in denoising loop
+    denoising_prefetch_steps: int = 1  # Number of steps to prefetch ahead
+    enable_pinned_memory: bool = True  # Use pinned memory for H2D transfers
+    pinned_pool_size_mb: int = 256  # Size of pinned memory pool in MB
+
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
         default_factory=NunchakuSVDQuantArgs, repr=False
@@ -773,6 +779,33 @@ class ServerArgs:
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
+        )
+
+        # Async Stage Pipelining (Phase 1: Denoising internal optimization)
+        parser.add_argument(
+            "--enable-denoising-pipeline",
+            action=StoreBoolean,
+            default=ServerArgs.enable_denoising_pipeline,
+            help="Enable CPU-GPU overlap in denoising loop for improved throughput. "
+            "Uses separate CUDA streams for data transfer and compute.",
+        )
+        parser.add_argument(
+            "--denoising-prefetch-steps",
+            type=int,
+            default=ServerArgs.denoising_prefetch_steps,
+            help="Number of denoising steps to prefetch ahead (default: 1).",
+        )
+        parser.add_argument(
+            "--enable-pinned-memory",
+            action=StoreBoolean,
+            default=ServerArgs.enable_pinned_memory,
+            help="Use pinned (page-locked) memory for faster H2D transfers in async pipeline.",
+        )
+        parser.add_argument(
+            "--pinned-pool-size-mb",
+            type=int,
+            default=ServerArgs.pinned_pool_size_mb,
+            help="Size of pinned memory pool in MB (default: 256).",
         )
 
         # Nunchaku SVDQuant quantization parameters

@@ -59,11 +59,16 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
     TransformerLoader,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines_core.pinned_memory_pool import (
+    PinnedMemoryPool,
+    get_pinned_memory_pool,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stream_manager import StreamManager
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -128,6 +133,9 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+
+        # Async stage pipelining infrastructure
+        self._stream_manager: StreamManager | None = None
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -967,6 +975,117 @@ class DenoisingStage(PipelineStage):
 
         return latents
 
+    def _prepare_next_step_metadata(
+        self,
+        next_step_idx: int,
+        batch: Req,
+        server_args: ServerArgs,
+        timesteps_cpu: torch.Tensor,
+        stream_manager: StreamManager | None,
+        pinned_pool: PinnedMemoryPool | None = None,
+        pending_pinned_buffers: list[torch.Tensor] | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Prefetch attention metadata for the next denoising step.
+        This can run concurrently with GPU compute on copy_stream.
+
+        Args:
+            next_step_idx: Index of the next step to prepare
+            batch: Current request batch
+            server_args: Server arguments
+            timesteps_cpu: CPU tensor of timesteps
+            stream_manager: StreamManager instance (or None if async disabled)
+
+        Returns:
+            Pre-computed attention metadata for the next step, or None
+        """
+        if stream_manager is None or next_step_idx >= len(timesteps_cpu):
+            return None
+
+        next_t_int = int(timesteps_cpu[next_step_idx].item())
+
+        # Build attention metadata for next step on copy stream
+        with stream_manager.copy_stream_context():
+            next_attn_metadata = self._build_attn_metadata(
+                next_step_idx,
+                batch,
+                server_args,
+                timestep_value=next_t_int,
+                timesteps=timesteps_cpu,
+            )
+            next_attn_metadata = self._move_tensors_to_device(
+                next_attn_metadata,
+                target_device=get_local_torch_device(),
+                pinned_pool=pinned_pool,
+                pending_pinned_buffers=pending_pinned_buffers,
+                non_blocking=True,
+            )
+            stream_manager.record_copy_done()
+        return next_attn_metadata
+
+    def _move_tensors_to_device(
+        self,
+        obj: Any,
+        target_device: torch.device,
+        pinned_pool: PinnedMemoryPool | None,
+        pending_pinned_buffers: list[torch.Tensor] | None,
+        non_blocking: bool,
+    ) -> Any:
+        """Recursively move CPU tensors in metadata to target device."""
+        if isinstance(obj, torch.Tensor):
+            if obj.device.type != "cpu" or target_device.type != "cuda":
+                return obj
+            if pinned_pool is not None and pinned_pool.enabled:
+                staged_gpu, staged_pinned = pinned_pool.async_copy(
+                    obj,
+                    target_device=target_device,
+                    non_blocking=non_blocking,
+                )
+                if (
+                    non_blocking
+                    and staged_pinned is not None
+                    and pending_pinned_buffers is not None
+                ):
+                    pending_pinned_buffers.append(staged_pinned)
+                elif staged_pinned is not None:
+                    pinned_pool.return_buffer(staged_pinned)
+                return staged_gpu
+            return obj.to(target_device, non_blocking=non_blocking)
+        if isinstance(obj, dict):
+            return {
+                k: self._move_tensors_to_device(
+                    v,
+                    target_device=target_device,
+                    pinned_pool=pinned_pool,
+                    pending_pinned_buffers=pending_pinned_buffers,
+                    non_blocking=non_blocking,
+                )
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [
+                self._move_tensors_to_device(
+                    v,
+                    target_device=target_device,
+                    pinned_pool=pinned_pool,
+                    pending_pinned_buffers=pending_pinned_buffers,
+                    non_blocking=non_blocking,
+                )
+                for v in obj
+            ]
+        if isinstance(obj, tuple):
+            return tuple(
+                self._move_tensors_to_device(
+                    v,
+                    target_device=target_device,
+                    pinned_pool=pinned_pool,
+                    pending_pinned_buffers=pending_pinned_buffers,
+                    non_blocking=non_blocking,
+                )
+                for v in obj
+            )
+        return obj
+
     @torch.no_grad()
     def forward(
         self,
@@ -1002,11 +1121,52 @@ class DenoisingStage(PipelineStage):
         # Run denoising loop
         denoising_start_time = time.time()
 
+        # Initialize async pipelining if enabled
+        use_async_pipeline = server_args.enable_denoising_pipeline
+        if use_async_pipeline:
+            if self._stream_manager is None:
+                self._stream_manager = StreamManager.create(
+                    device=latents.device,
+                    enabled=True,
+                )
+            stream_manager = self._stream_manager
+        else:
+            stream_manager = None
+        pinned_pool: PinnedMemoryPool | None = None
+        if server_args.enable_pinned_memory:
+            pinned_pool = get_pinned_memory_pool(
+                max_size_mb=server_args.pinned_pool_size_mb,
+                enabled=server_args.enable_pinned_memory,
+            )
+        timestep_pinned_buffer: torch.Tensor | None = None
+
         # to avoid device-sync caused by timestep comparison
         is_warmup = batch.is_warmup
         self.scheduler.set_begin_index(0)
-        timesteps_cpu = timesteps.cpu()
+        if (
+            use_async_pipeline
+            and stream_manager is not None
+            and pinned_pool is not None
+            and pinned_pool.enabled
+            and timesteps.device.type == "cuda"
+        ):
+            with stream_manager.copy_stream_context():
+                timesteps_cpu, timestep_pinned_buffer = pinned_pool.async_copy(
+                    timesteps,
+                    target_device=torch.device("cpu"),
+                    non_blocking=True,
+                )
+                stream_manager.record_copy_done()
+            # timesteps will be consumed on CPU immediately below.
+            stream_manager.sync_copy_stream()
+        else:
+            timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
+
+        # For async pipeline: prefetch first step's metadata
+        prefetched_attn_metadata: dict[str, Any] | None = None
+        prefetched_pinned_buffers: list[torch.Tensor] = []
+
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=target_dtype,
@@ -1055,14 +1215,43 @@ class DenoisingStage(PipelineStage):
                             latent_model_input, t_device
                         )
 
-                        # Predict noise residual
-                        attn_metadata = self._build_attn_metadata(
-                            i,
-                            batch,
-                            server_args,
-                            timestep_value=t_int,
-                            timesteps=timesteps_cpu,
-                        )
+                        # Use prefetched attn_metadata if available, otherwise build now
+                        if prefetched_attn_metadata is not None and use_async_pipeline:
+                            stream_manager.wait_copy_done()
+                            attn_metadata = prefetched_attn_metadata
+                            prefetched_attn_metadata = None
+                            if pinned_pool is not None:
+                                for buf in prefetched_pinned_buffers:
+                                    pinned_pool.return_buffer(buf)
+                                prefetched_pinned_buffers.clear()
+                        else:
+                            attn_metadata = self._build_attn_metadata(
+                                i,
+                                batch,
+                                server_args,
+                                timestep_value=t_int,
+                                timesteps=timesteps_cpu,
+                            )
+                            attn_metadata = self._move_tensors_to_device(
+                                attn_metadata,
+                                target_device=get_local_torch_device(),
+                                pinned_pool=pinned_pool,
+                                pending_pinned_buffers=None,
+                                non_blocking=False,
+                            )
+
+                        # Start prefetching next step's attn_metadata while GPU computes
+                        if use_async_pipeline and i + 1 < num_timesteps:
+                            prefetched_attn_metadata = self._prepare_next_step_metadata(
+                                next_step_idx=i + 1,
+                                batch=batch,
+                                server_args=server_args,
+                                timesteps_cpu=timesteps_cpu,
+                                stream_manager=stream_manager,
+                                pinned_pool=pinned_pool,
+                                pending_pinned_buffers=prefetched_pinned_buffers,
+                            )
+
                         noise_pred = self._predict_noise_with_cfg(
                             current_model=current_model,
                             latent_model_input=latent_model_input,
@@ -1112,6 +1301,19 @@ class DenoisingStage(PipelineStage):
 
                         if not is_warmup:
                             self.step_profile()
+
+                        # Record event for this step completion (for async pipeline timing)
+                        if use_async_pipeline and stream_manager is not None:
+                            stream_manager.record_step_done(i)
+
+        # Synchronize streams if async pipeline was used
+        if use_async_pipeline and stream_manager is not None:
+            stream_manager.sync_all()
+        if pinned_pool is not None:
+            if timestep_pinned_buffer is not None:
+                pinned_pool.return_buffer(timestep_pinned_buffer)
+            for buf in prefetched_pinned_buffers:
+                pinned_pool.return_buffer(buf)
 
         denoising_end_time = time.time()
 
