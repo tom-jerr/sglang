@@ -810,6 +810,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 
+        if batch.return_logprob and not batch.forward_mode.is_idle():
+            self._compute_spec_v2_logprobs(batch, logits_output, predict, accept_index)
+
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
@@ -887,6 +890,90 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 mamba_track_indices=batch.mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=self.target_worker.model_runner.model,
+            )
+
+    def _compute_spec_v2_logprobs(
+        self,
+        batch: ModelWorkerBatch,
+        logits_output,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+    ):
+        """
+        Compute logprobs for spec v2 on GPU. No CPU sync happens here.
+        Results are stored in logits_output fields as GPU tensors.
+        D2H transfer happens later in copy_to_cpu().
+        """
+        from sglang.srt.layers.utils.logprob import (
+            get_token_ids_logprobs,
+            get_top_logprobs,
+        )
+
+        device = predict.device
+        bs, max_accept = accept_index.shape
+
+        # Keep a dense [bs, max_accept] layout. Invalid slots are filled with a
+        # per-request safe base index, so no CPU-side compacting/sync is needed.
+        mask = accept_index >= 0
+        req_base_indices = (
+            torch.arange(bs, device=device, dtype=accept_index.dtype).unsqueeze(1)
+            * self.speculative_num_draft_tokens
+        )
+        safe_accept_index = torch.where(mask, accept_index, req_base_indices)
+        safe_flat_indices = safe_accept_index.reshape(-1)
+
+        # Fancy indexing materializes a tensor and avoids stale CUDA graph views.
+        accepted_logits = logits_output.next_token_logits[safe_flat_indices]
+
+        req_indices = torch.arange(bs, device=device).repeat_interleave(max_accept)
+        temperatures = batch.sampling_info.temperatures
+        if temperatures.dim() == 1:
+            temperatures = temperatures.unsqueeze(-1)
+        temperatures = temperatures[req_indices]
+        if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
+            logprobs = torch.nn.functional.log_softmax(accepted_logits, dim=-1)
+        else:
+            logprobs = torch.nn.functional.log_softmax(
+                accepted_logits / temperatures, dim=-1
+            )
+
+        accepted_token_ids = predict[safe_flat_indices]
+        logits_output.next_token_logprobs = logprobs[
+            torch.arange(bs * max_accept, device=device),
+            accepted_token_ids,
+        ].view(bs, max_accept)
+
+        top_logprobs_nums = batch.top_logprobs_nums
+        should_top_logprobs = any(x > 0 for x in top_logprobs_nums)
+        if should_top_logprobs:
+            top_logprobs_nums_expanded = [
+                num for num in top_logprobs_nums for _ in range(max_accept)
+            ]
+
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = get_top_logprobs(
+                logprobs,
+                top_logprobs_nums_expanded,
+                delay_cpu_copy=True,
+            )
+
+        token_ids_logprobs = batch.token_ids_logprobs
+        should_token_ids_logprobs = any(x is not None for x in token_ids_logprobs)
+
+        if should_token_ids_logprobs:
+            token_ids_logprobs_expanded = [
+                token_ids for token_ids in token_ids_logprobs for _ in range(max_accept)
+            ]
+
+            (
+                logits_output.next_token_token_ids_logprobs_val,
+                logits_output.next_token_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs(
+                logprobs,
+                token_ids_logprobs_expanded,
+                delay_cpu_copy=True,
             )
 
     def move_accepted_tokens_to_target_kvcache(
