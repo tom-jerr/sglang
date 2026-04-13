@@ -57,6 +57,11 @@ from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
+from sglang.srt.c2r import (
+    OnlineC2RManager,
+    get_global_online_c2r_manager,
+    set_global_online_c2r_manager,
+)
 from sglang.srt.distributed import (
     get_default_distributed_backend,
     get_pp_group,
@@ -486,6 +491,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_global_expert_location_metadata(),
                     rank=self.tp_rank,
                 )
+            )
+            set_global_online_c2r_manager(
+                OnlineC2RManager.init_new(server_args, self.model_config)
             )
 
         # Expert parallelism
@@ -2683,27 +2691,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.forward_pass_id,
             forward_batch,
         ) as recorder_outputs:
-            output = self._forward_raw(
-                forward_batch,
-                skip_attn_backend_init,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
-            elastic_ep_state = ElasticEPStateManager.instance()
-            if (
-                elastic_ep_state is not None
-                and not elastic_ep_state.is_active_equal_last()
-            ):
-                elastic_ep_state.snapshot_active_to_last()
-                elastic_ep_state.sync_active_to_cpu()
-                logging.info("EPLB due to rank faults")
-                gen = self.eplb_manager.rebalance()
-                while True:
-                    try:
-                        next(gen)
-                    except StopIteration:
-                        break
+            online_c2r_manager = get_global_online_c2r_manager()
+            try:
+                if online_c2r_manager is not None:
+                    online_c2r_manager.set_current_forward_mode(
+                        forward_batch.forward_mode
+                    )
                 output = self._forward_raw(
                     forward_batch,
                     skip_attn_backend_init,
@@ -2711,6 +2704,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     reinit_attn_backend,
                     split_forward_count,
                 )
+                elastic_ep_state = ElasticEPStateManager.instance()
+                if (
+                    elastic_ep_state is not None
+                    and not elastic_ep_state.is_active_equal_last()
+                ):
+                    elastic_ep_state.snapshot_active_to_last()
+                    elastic_ep_state.sync_active_to_cpu()
+                    logging.info("EPLB due to rank faults")
+                    gen = self.eplb_manager.rebalance()
+                    while True:
+                        try:
+                            next(gen)
+                        except StopIteration:
+                            break
+                    output = self._forward_raw(
+                        forward_batch,
+                        skip_attn_backend_init,
+                        pp_proxy_tensors,
+                        reinit_attn_backend,
+                        split_forward_count,
+                    )
+            finally:
+                if online_c2r_manager is not None:
+                    online_c2r_manager.clear_current_forward_mode()
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache
@@ -2722,6 +2739,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
+
+        online_c2r_manager = get_global_online_c2r_manager()
+        if online_c2r_manager is not None:
+            online_c2r_manager.on_forward_pass_end(self)
 
         if dumper.may_enable:
             dumper.step()

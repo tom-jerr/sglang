@@ -532,6 +532,18 @@ class ServerArgs:
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
     eplb_min_rebalancing_utilization_threshold: float = 1.0
+    enable_online_c2r: bool = False
+    c2r_top_t: int = 16
+    c2r_fallback_threshold: float = 0.0
+    c2r_route_top2_only: bool = True
+    c2r_enable_prefill: bool = True
+    c2r_enable_decode: bool = True
+    c2r_warmup_num_iterations: int = 128
+    c2r_policy_update_num_iterations: int = 128
+    c2r_rebalance_num_iterations: int = 1024
+    c2r_group_max_size: Optional[int] = None
+    c2r_min_expert_samples: int = 32
+    c2r_min_layer_coverage: int = 128
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "stat_approx", "per_pass", "per_token"]
     ] = None
@@ -810,6 +822,7 @@ class ServerArgs:
         self._handle_a2a_moe()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
+        self._handle_online_c2r()
         self._handle_elastic_ep()
 
         # Handle pipeline parallelism.
@@ -2838,6 +2851,34 @@ class ServerArgs:
                 self.expert_distribution_recorder_buffer_size = x
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
+
+    def _handle_online_c2r(self):
+        if not self.enable_online_c2r:
+            return
+
+        assert self.ep_size > 1, "Online C2R requires expert parallelism."
+        assert self.c2r_top_t > 0, "c2r_top_t must be positive."
+        assert (
+            self.c2r_policy_update_num_iterations > 0
+        ), "c2r_policy_update_num_iterations must be positive."
+        assert (
+            self.c2r_rebalance_num_iterations > 0
+        ), "c2r_rebalance_num_iterations must be positive."
+        assert (
+            self.c2r_warmup_num_iterations >= 0
+        ), "c2r_warmup_num_iterations must be non-negative."
+        assert (
+            self.c2r_min_expert_samples >= 0
+        ), "c2r_min_expert_samples must be non-negative."
+        assert (
+            self.c2r_min_layer_coverage >= 0
+        ), "c2r_min_layer_coverage must be non-negative."
+        assert (
+            self.c2r_enable_prefill or self.c2r_enable_decode
+        ), "Online C2R must be enabled for prefill and/or decode."
+
+        if self.ep_dispatch_algorithm is None:
+            self.ep_dispatch_algorithm = "static"
 
     def _handle_pipeline_parallelism(self):
         if self.pp_size > 1:
@@ -4973,6 +5014,77 @@ class ServerArgs:
             type=float,
             default=ServerArgs.eplb_min_rebalancing_utilization_threshold,
             help="Minimum threshold for GPU average utilization to trigger EPLB rebalancing. Must be in the range [0.0, 1.0].",
+        )
+        parser.add_argument(
+            "--enable-online-c2r",
+            action="store_true",
+            help="Enable online C2R statistics, constrained routing, and group-aware EP rebalancing.",
+        )
+        parser.add_argument(
+            "--c2r-top-t",
+            type=int,
+            default=ServerArgs.c2r_top_t,
+            help="The maximum familiar-set size per expert for online C2R routing.",
+        )
+        parser.add_argument(
+            "--c2r-fallback-threshold",
+            type=float,
+            default=ServerArgs.c2r_fallback_threshold,
+            help="Fallback score threshold for constrained routing. Tokens below the threshold fall back to the original route.",
+        )
+        parser.add_argument(
+            "--c2r-route-top2-only",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.c2r_route_top2_only,
+            help="Only constrain top2 with online C2R. Disable to constrain every routed expert after top1.",
+        )
+        parser.add_argument(
+            "--c2r-enable-prefill",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.c2r_enable_prefill,
+            help="Enable online C2R during prefill/extend batches.",
+        )
+        parser.add_argument(
+            "--c2r-enable-decode",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.c2r_enable_decode,
+            help="Enable online C2R during decode batches.",
+        )
+        parser.add_argument(
+            "--c2r-warmup-num-iterations",
+            type=int,
+            default=ServerArgs.c2r_warmup_num_iterations,
+            help="Number of forward passes to observe before applying online C2R constraints.",
+        )
+        parser.add_argument(
+            "--c2r-policy-update-num-iterations",
+            type=int,
+            default=ServerArgs.c2r_policy_update_num_iterations,
+            help="Number of forward passes between familiar-set and group refreshes.",
+        )
+        parser.add_argument(
+            "--c2r-rebalance-num-iterations",
+            type=int,
+            default=ServerArgs.c2r_rebalance_num_iterations,
+            help="Number of forward passes between online C2R placement rebalancing attempts.",
+        )
+        parser.add_argument(
+            "--c2r-group-max-size",
+            type=int,
+            default=ServerArgs.c2r_group_max_size,
+            help="Maximum number of experts assigned to the same online C2R group. Defaults to the local physical expert budget.",
+        )
+        parser.add_argument(
+            "--c2r-min-expert-samples",
+            type=int,
+            default=ServerArgs.c2r_min_expert_samples,
+            help="Minimum number of routed samples before an expert receives a familiar set.",
+        )
+        parser.add_argument(
+            "--c2r-min-layer-coverage",
+            type=int,
+            default=ServerArgs.c2r_min_layer_coverage,
+            help="Minimum routed samples per layer before online C2R refreshes policy for that layer.",
         )
         parser.add_argument(
             "--expert-distribution-recorder-mode",

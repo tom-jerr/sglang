@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import logging
 import time
 from typing import List, Optional, Tuple
@@ -27,7 +28,11 @@ from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -70,6 +75,19 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+
+EAGLE_KV_ALIGN_RERUN_K = "rerun_k"
+EAGLE_KV_ALIGN_APPEND_LAST = "append_last"
+
+
+def _normalize_kv_align_mode(raw_mode: str) -> str:
+    mode = (raw_mode or EAGLE_KV_ALIGN_RERUN_K).strip().lower()
+    if mode not in {EAGLE_KV_ALIGN_RERUN_K, EAGLE_KV_ALIGN_APPEND_LAST}:
+        raise ValueError(
+            "Unsupported SGLANG_EAGLE_KV_ALIGN_MODE. "
+            f"Expected one of {[EAGLE_KV_ALIGN_RERUN_K, EAGLE_KV_ALIGN_APPEND_LAST]}, got {raw_mode!r}."
+        )
+    return mode
 
 
 def _get_plan_stream(
@@ -544,21 +562,49 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.hidden_states = logits_output.hidden_states
         return next_draft_input
 
-    def _draft_extend_for_decode(
+    def _get_decode_select_index(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
+    ) -> torch.Tensor:
+        return (
+            torch.arange(len(batch.seq_lens), device=self.device)
+            * self.speculative_num_draft_tokens
+            + batch_result.accept_lens
+            - 1
+        )
+
+    def _update_next_draft_input(
+        self,
+        batch_result: GenerationBatchResult,
+        selected_logits: torch.Tensor,
+        selected_hidden_states: torch.Tensor,
     ):
+        probs = torch.softmax(selected_logits, dim=-1)
+        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+        next_draft_input = batch_result.next_draft_input
+        (
+            next_draft_input.topk_p,
+            next_draft_input.topk_index,
+            next_draft_input.hidden_states,
+        ) = (
+            ret_topk_p,
+            ret_topk_index,
+            selected_hidden_states,
+        )
+        return next_draft_input
+
+    def _draft_extend_rerun_k_for_decode(
+        self,
+        batch: ModelWorkerBatch,
+        batch_result: GenerationBatchResult,
+        update_next_draft_input: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
             num_tokens_per_req=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
         )
-        select_index = (
-            torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
-            + batch_result.accept_lens
-            - 1
-        )
+        select_index = self._get_decode_select_index(batch, batch_result)
 
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
@@ -597,28 +643,67 @@ class EagleDraftWorker(BaseDraftWorker):
             f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
         )
 
-        # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-            select_index
-        ]
-        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
-        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-        ret_hidden_states = draft_logits_output.hidden_states
+        selected_logits = draft_logits_output.next_token_logits[select_index]
+        selected_hidden_states = draft_logits_output.hidden_states[select_index]
+        if update_next_draft_input:
+            self._update_next_draft_input(
+                batch_result, selected_logits, selected_hidden_states
+            )
+        return selected_logits, selected_hidden_states
 
-        # Construct the return values
-        next_draft_input = batch_result.next_draft_input
-        (
-            next_draft_input.topk_p,
-            next_draft_input.topk_index,
-            next_draft_input.hidden_states,
-        ) = (
-            ret_topk_p,
-            ret_topk_index,
-            ret_hidden_states,
+    def _draft_extend_append_last_for_decode(
+        self,
+        batch: ModelWorkerBatch,
+        batch_result: GenerationBatchResult,
+        update_next_draft_input: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        select_index = self._get_decode_select_index(batch, batch_result)
+        verified_id = batch_result.next_draft_input.verified_id
+        hidden_states = batch_result.logits_output.hidden_states[select_index]
+        prefix_lens = batch.seq_lens + batch_result.accept_lens - 1
+        seq_lens = prefix_lens + 1
+        temp_batch = copy.copy(batch)
+        temp_batch.input_ids = verified_id
+        temp_batch.seq_lens = seq_lens
+        temp_batch.seq_lens_cpu = seq_lens.cpu()
+        temp_batch.seq_lens_sum = temp_batch.seq_lens_cpu.sum().item()
+        temp_batch.out_cache_loc = batch.out_cache_loc[select_index].contiguous()
+        temp_batch.extend_num_tokens = len(batch.seq_lens)
+        temp_batch.extend_seq_lens = [1] * len(batch.seq_lens)
+        temp_batch.extend_prefix_lens = prefix_lens.cpu().tolist()
+        temp_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        temp_batch.forward_mode = (
+            temp_batch.forward_mode
+            if temp_batch.forward_mode.is_idle()
+            else ForwardMode.DRAFT_EXTEND_V2
         )
+        temp_batch.return_logprob = False
+        temp_batch.spec_info = EagleDraftInput(
+            hidden_states=hidden_states,
+            verified_id=verified_id,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+
+        forward_batch = ForwardBatch.init_new(temp_batch, self.draft_runner)
+        forward_batch.can_run_dp_cuda_graph = False
+        if not forward_batch.forward_mode.is_idle():
+            self.draft_runner.attn_backend.init_forward_metadata(forward_batch)
+        draft_logits_output = self.draft_runner.forward(
+            forward_batch, skip_attn_backend_init=True
+        ).logits_output
+        maybe_detect_nan(
+            draft_logits_output.next_token_logits,
+            "draft_extend_append_last_for_decode",
+        )
+
+        selected_logits = draft_logits_output.next_token_logits
+        selected_hidden_states = draft_logits_output.hidden_states
+        if update_next_draft_input:
+            self._update_next_draft_input(
+                batch_result, selected_logits, selected_hidden_states
+            )
+        return selected_logits, selected_hidden_states
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -674,6 +759,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.kv_align_mode = _normalize_kv_align_mode(
+            envs.SGLANG_EAGLE_KV_ALIGN_MODE.get()
+        )
+        self.kv_align_compare = envs.SGLANG_EAGLE_KV_ALIGN_COMPARE.get()
+        self.kv_align_compare_topk = max(1, envs.SGLANG_EAGLE_KV_ALIGN_COMPARE_TOPK.get())
+        self._kv_align_compare_stats = {
+            "mode": self.kv_align_mode,
+            "compare_enabled": self.kv_align_compare,
+            "count": 0,
+            "hidden_l2_sum": 0.0,
+            "hidden_cosine_sum": 0.0,
+            "logits_kl_sum": 0.0,
+            "top1_match_sum": 0.0,
+            "topk_overlap_sum": 0.0,
+            "latest": None,
+        }
 
     @property
     def target_worker(self):
@@ -686,6 +787,113 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
+
+    def get_kv_align_debug_stats(self):
+        if not self.kv_align_compare and self.kv_align_mode == EAGLE_KV_ALIGN_RERUN_K:
+            return None
+
+        ret = dict(self._kv_align_compare_stats)
+        count = ret["count"]
+        if count > 0:
+            ret["hidden_l2_mean"] = ret["hidden_l2_sum"] / count
+            ret["hidden_cosine_mean"] = ret["hidden_cosine_sum"] / count
+            ret["logits_kl_mean"] = ret["logits_kl_sum"] / count
+            ret["top1_match_rate"] = ret["top1_match_sum"] / count
+            ret["topk_overlap_mean"] = ret["topk_overlap_sum"] / count
+        return ret
+
+    def _record_kv_align_compare(
+        self,
+        rerun_logits: torch.Tensor,
+        rerun_hidden: torch.Tensor,
+        append_logits: torch.Tensor,
+        append_hidden: torch.Tensor,
+    ):
+        rerun_logits_fp32 = rerun_logits.float()
+        append_logits_fp32 = append_logits.float()
+        rerun_hidden_fp32 = rerun_hidden.float()
+        append_hidden_fp32 = append_hidden.float()
+
+        hidden_l2 = torch.linalg.norm(
+            rerun_hidden_fp32 - append_hidden_fp32, dim=-1
+        ).mean()
+        hidden_cosine = torch.nn.functional.cosine_similarity(
+            rerun_hidden_fp32, append_hidden_fp32, dim=-1
+        ).mean()
+
+        rerun_log_probs = torch.log_softmax(rerun_logits_fp32, dim=-1)
+        append_log_probs = torch.log_softmax(append_logits_fp32, dim=-1)
+        rerun_probs = rerun_log_probs.exp()
+        logits_kl = torch.sum(
+            rerun_probs * (rerun_log_probs - append_log_probs), dim=-1
+        ).mean()
+
+        rerun_top1 = torch.argmax(rerun_logits_fp32, dim=-1)
+        append_top1 = torch.argmax(append_logits_fp32, dim=-1)
+        top1_match = (rerun_top1 == append_top1).float().mean()
+
+        overlap_k = min(self.kv_align_compare_topk, rerun_logits_fp32.shape[-1])
+        rerun_topk = torch.topk(rerun_logits_fp32, k=overlap_k, dim=-1).indices
+        append_topk = torch.topk(append_logits_fp32, k=overlap_k, dim=-1).indices
+        topk_overlap = []
+        for rerun_row, append_row in zip(rerun_topk.tolist(), append_topk.tolist()):
+            topk_overlap.append(len(set(rerun_row) & set(append_row)) / overlap_k)
+        topk_overlap_mean = sum(topk_overlap) / max(len(topk_overlap), 1)
+
+        stats = self._kv_align_compare_stats
+        stats["count"] += 1
+        stats["hidden_l2_sum"] += hidden_l2.item()
+        stats["hidden_cosine_sum"] += hidden_cosine.item()
+        stats["logits_kl_sum"] += logits_kl.item()
+        stats["top1_match_sum"] += top1_match.item()
+        stats["topk_overlap_sum"] += topk_overlap_mean
+        stats["latest"] = {
+            "hidden_l2": hidden_l2.item(),
+            "hidden_cosine": hidden_cosine.item(),
+            "logits_kl": logits_kl.item(),
+            "top1_match": bool(torch.all(rerun_top1 == append_top1).item()),
+            "topk_overlap": topk_overlap_mean,
+            "rerun_token_ids": rerun_top1.tolist(),
+            "append_last_token_ids": append_top1.tolist(),
+        }
+
+    def _draft_extend_for_decode_with_mode(
+        self, batch: ModelWorkerBatch, batch_output: GenerationBatchResult
+    ):
+        if self.kv_align_mode == EAGLE_KV_ALIGN_APPEND_LAST:
+            actual_logits, actual_hidden = (
+                self.draft_worker._draft_extend_append_last_for_decode(
+                    batch, batch_output, update_next_draft_input=True
+                )
+            )
+        else:
+            actual_logits, actual_hidden = (
+                self.draft_worker._draft_extend_rerun_k_for_decode(
+                    batch, batch_output
+                )
+            )
+
+        if self.kv_align_compare:
+            if self.kv_align_mode == EAGLE_KV_ALIGN_APPEND_LAST:
+                rerun_logits, rerun_hidden = (
+                    self.draft_worker._draft_extend_rerun_k_for_decode(
+                        batch, batch_output, update_next_draft_input=False
+                    )
+                )
+                append_logits, append_hidden = actual_logits, actual_hidden
+            else:
+                append_logits, append_hidden = (
+                    self.draft_worker._draft_extend_append_last_for_decode(
+                        batch, batch_output, update_next_draft_input=False
+                    )
+                )
+                rerun_logits, rerun_hidden = actual_logits, actual_hidden
+            self._record_kv_align_compare(
+                rerun_logits,
+                rerun_hidden,
+                append_logits,
+                append_hidden,
+            )
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if (
@@ -733,9 +941,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                self.draft_worker._draft_extend_for_decode(
-                    model_worker_batch, batch_output
-                )
+                self._draft_extend_for_decode_with_mode(model_worker_batch, batch_output)
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):

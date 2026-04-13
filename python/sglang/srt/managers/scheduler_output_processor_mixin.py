@@ -348,6 +348,7 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
             req.spec_verify_ct += 1
+            req.maybe_record_spec_accept_length(accept_lens[i])
 
             accepted_draft_tokens = result.accept_length_per_req_cpu[i]
             req.spec_accepted_tokens += accepted_draft_tokens
@@ -917,6 +918,7 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         spec_accepted_tokens = []
         spec_acceptance_histogram = []
+        spec_accept_length_trace = []
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
@@ -1025,6 +1027,7 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
+                    spec_accept_length_trace.append(req.spec_accept_length_trace)
 
                 if return_logprob:
                     if (
@@ -1129,6 +1132,7 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
                     spec_acceptance_histogram=spec_acceptance_histogram,
+                    spec_accept_length_trace=spec_accept_length_trace,
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,

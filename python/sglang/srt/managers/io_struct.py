@@ -101,6 +101,10 @@ class SpeculativeDecodingMetricsMixin:
     # Empty list [] when speculative decoding is disabled.
     spec_acceptance_histogram: List[List[int]]
 
+    # Optional per-step total accept lengths (includes the bonus token) for
+    # speculative decoding analysis.
+    spec_accept_length_trace: List[List[int]]
+
 
 # Parameters for a session
 @dataclass

@@ -1938,6 +1938,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     i
                 ]
 
+            if (
+                envs.SGLANG_COLLECT_SPEC_ACCEPT_LENGTH_TRACE.get()
+                and getattr(recv_obj, "spec_accept_length_trace", None)
+                and len(recv_obj.spec_accept_length_trace) > i
+                and recv_obj.spec_accept_length_trace[i]
+            ):
+                meta_info["spec_accept_length_trace"] = recv_obj.spec_accept_length_trace[
+                    i
+                ]
+
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (
             obj.sampling_params.get("json_schema", None)

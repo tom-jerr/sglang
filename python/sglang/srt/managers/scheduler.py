@@ -3055,6 +3055,15 @@ class Scheduler(
                 self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
             )
 
+        if (
+            not self.spec_algorithm.is_none()
+            and getattr(self, "draft_worker", None) is not None
+            and hasattr(self.draft_worker, "get_kv_align_debug_stats")
+        ):
+            kv_align_stats = self.draft_worker.get_kv_align_debug_stats()
+            if kv_align_stats is not None:
+                ret["eagle_kv_align_debug"] = kv_align_stats
+
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 

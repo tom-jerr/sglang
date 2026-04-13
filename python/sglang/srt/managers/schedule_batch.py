@@ -787,6 +787,10 @@ class Req(ReqDllmMixin):
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
         self.spec_acceptance_histogram: List[int] = []
 
+        # Optional per-step total accept lengths (including the bonus token).
+        # This is only populated when explicitly requested for debugging.
+        self.spec_accept_length_trace: List[int] = []
+
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None
@@ -883,6 +887,10 @@ class Req(ReqDllmMixin):
                 [0] * (accepted_draft_tokens - len(self.spec_acceptance_histogram) + 1)
             )
         self.spec_acceptance_histogram[accepted_draft_tokens] += 1
+
+    def maybe_record_spec_accept_length(self, accept_length: int):
+        if envs.SGLANG_COLLECT_SPEC_ACCEPT_LENGTH_TRACE.get():
+            self.spec_accept_length_trace.append(accept_length)
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:

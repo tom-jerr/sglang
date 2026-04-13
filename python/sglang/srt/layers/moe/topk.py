@@ -40,6 +40,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.c2r import get_global_online_c2r_manager
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import (
@@ -1097,6 +1098,22 @@ def select_experts(
             topk=num_routed_topk if _use_aiter else top_k,
             renormalize=renormalize,
         )
+
+    online_c2r_manager = get_global_online_c2r_manager()
+    if online_c2r_manager is not None:
+        topk_ids, topk_weights = online_c2r_manager.maybe_apply_routing_constraints(
+            layer_id=layer_id,
+            router_logits=router_logits,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            use_grouped_topk=use_grouped_topk,
+            num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
+            renormalize=renormalize,
+            scoring_func=scoring_func,
+            correction_bias=correction_bias,
+        )
+        online_c2r_manager.record_topk(layer_id=layer_id, logical_topk_ids=topk_ids)
 
     topk_ids, topk_weights = _post_process_topk_ids(
         topk_ids=topk_ids,
