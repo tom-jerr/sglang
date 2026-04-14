@@ -2581,6 +2581,7 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        forward_tic = time.perf_counter()
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
@@ -2721,6 +2722,13 @@ class Scheduler(
             self.send_to_tokenizer.send_output(
                 ActiveRanksOutput(status=dp_active_ranks.tolist())
             )
+
+        if batch.forward_mode.is_extend():
+            duration_ms = (time.perf_counter() - forward_tic) * 1000.0
+            if self.prefill_ewma_ms <= 0:
+                self.prefill_ewma_ms = duration_ms
+            else:
+                self.prefill_ewma_ms = self.prefill_ewma_ms * 0.8 + duration_ms * 0.2
 
         return ret
 

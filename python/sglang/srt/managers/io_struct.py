@@ -1768,6 +1768,15 @@ class GetLoadReqOutput(BaseReq):
     num_waiting_reqs: int
     num_tokens: int
     ts_tic: float
+    forward_mode: str = "idle"
+    prefill_locked: bool = False
+    running_batch_size: int = 0
+    inflight_prefill_tokens: int = 0
+    queued_prefill_reqs: int = 0
+    queued_prefill_tokens: int = 0
+    queued_decode_reqs: int = 0
+    prefill_ewma_ms: float = 0.0
+    oldest_wait_ms: float = 0.0
 
 
 @dataclass

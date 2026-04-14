@@ -440,6 +440,8 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "auto"
+    staggered_max_wait_ms: float = 5.0
+    staggered_kv_outlier_k: float = 1.5
 
     attn_cp_size: int = 1
     moe_dp_size: int = 1
@@ -4548,7 +4550,20 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "staggered_stage_aware",
             ],
+        )
+        parser.add_argument(
+            "--staggered-max-wait-ms",
+            type=float,
+            default=ServerArgs.staggered_max_wait_ms,
+            help="Maximum buffering window in milliseconds for staggered stage-aware DP routing.",
+        )
+        parser.add_argument(
+            "--staggered-kv-outlier-k",
+            type=float,
+            default=ServerArgs.staggered_kv_outlier_k,
+            help="IQR multiplier for decode-load outlier masking in staggered stage-aware DP routing.",
         )
         parser.add_argument(
             "--prefill-round-robin-balance",

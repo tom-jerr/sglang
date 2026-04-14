@@ -96,6 +96,7 @@ class SchedulerMetricsMixin:
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_prefill_tokens = 0
+        self.prefill_ewma_ms: float = 0.0
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -873,15 +874,30 @@ class SchedulerMetricsMixin:
 
         # Tokens in waiting queue, bootstrap queue, prealloc queue
         waiting_queues = [self.waiting_queue]
+        prefill_queues = [self.waiting_queue]
+        decode_queues = []
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
+            prefill_queues.append(self.disagg_prefill_bootstrap_queue.queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
             waiting_queues.append(self.disagg_decode_transfer_queue.queue)
             waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
+            decode_queues.extend(
+                [
+                    self.disagg_decode_prealloc_queue.queue,
+                    self.disagg_decode_transfer_queue.queue,
+                    self.disagg_decode_prealloc_queue.retracted_queue,
+                ]
+            )
 
         num_tokens += sum(req.seqlen for queue in waiting_queues for req in queue)
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
+        (
+            forward_mode,
+            prefill_locked,
+            inflight_prefill_tokens,
+        ) = self._get_load_forward_state()
 
         return GetLoadReqOutput(
             dp_rank=self.dp_rank,
@@ -889,7 +905,59 @@ class SchedulerMetricsMixin:
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
             ts_tic=time.perf_counter(),
+            forward_mode=forward_mode,
+            prefill_locked=prefill_locked,
+            running_batch_size=len(self.running_batch.reqs),
+            inflight_prefill_tokens=inflight_prefill_tokens,
+            queued_prefill_reqs=sum(len(queue) for queue in prefill_queues),
+            queued_prefill_tokens=self._sum_prefill_tokens(prefill_queues),
+            queued_decode_reqs=sum(len(queue) for queue in decode_queues),
+            prefill_ewma_ms=self.prefill_ewma_ms,
+            oldest_wait_ms=self._get_oldest_wait_ms(waiting_queues),
         )
+
+    def _sum_prefill_tokens(self: Scheduler, queues) -> int:
+        total = 0
+        for queue in queues:
+            for req in queue:
+                total += getattr(req, "extend_input_len", 0) or len(
+                    getattr(req, "fill_ids", []) or getattr(req, "origin_input_ids", [])
+                )
+        return total
+
+    def _get_oldest_wait_ms(self: Scheduler, queues) -> float:
+        now = time.perf_counter()
+        oldest = None
+        for queue in queues:
+            for req in queue:
+                ts = getattr(req.time_stats, "wait_queue_entry_time", None)
+                if ts is None:
+                    continue
+                oldest = ts if oldest is None else min(oldest, ts)
+        if oldest is None:
+            return 0.0
+        return max(0.0, (now - oldest) * 1000.0)
+
+    def _get_load_forward_state(self: Scheduler) -> Tuple[str, bool, int]:
+        batch = None
+        if self.cur_batch is not None and not self.cur_batch.is_empty():
+            batch = self.cur_batch
+        elif self.last_batch is not None and not self.last_batch.is_empty():
+            batch = self.last_batch
+
+        if batch is not None:
+            if batch.forward_mode.is_extend():
+                return "prefill", True, int(batch.extend_num_tokens or 0)
+            if batch.forward_mode.is_decode():
+                return "decode", False, 0
+            if batch.forward_mode.is_prebuilt():
+                return "idle", False, 0
+
+        if self.running_batch.is_empty():
+            return "idle", False, 0
+        if self.running_batch.is_prefill_only:
+            return "prefill", False, int(self.running_batch.extend_num_tokens or 0)
+        return "decode", False, 0
 
     def get_loads(self: Scheduler, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
         """

@@ -13,6 +13,8 @@
 # ==============================================================================
 """A controller that dispatches requests to multiple data parallel workers."""
 
+from collections import deque
+from dataclasses import dataclass
 import faulthandler
 import logging
 import multiprocessing as mp
@@ -68,6 +70,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    STAGGERED_STAGE_AWARE = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -107,6 +110,157 @@ class DPBudget:
         return target_rank
 
 
+@dataclass
+class WorkerLoadSnapshot:
+    dp_rank: int
+    num_reqs: int = 0
+    num_tokens: int = 0
+    forward_mode: str = "idle"
+    prefill_locked: bool = False
+    running_batch_size: int = 0
+    inflight_prefill_tokens: int = 0
+    queued_prefill_reqs: int = 0
+    queued_prefill_tokens: int = 0
+    queued_decode_reqs: int = 0
+    prefill_ewma_ms: float = 0.0
+    oldest_wait_ms: float = 0.0
+
+    @classmethod
+    def from_load(cls, load):
+        return cls(
+            dp_rank=load.dp_rank,
+            num_reqs=load.num_reqs,
+            num_tokens=load.num_tokens,
+            forward_mode=load.forward_mode,
+            prefill_locked=load.prefill_locked,
+            running_batch_size=load.running_batch_size,
+            inflight_prefill_tokens=load.inflight_prefill_tokens,
+            queued_prefill_reqs=load.queued_prefill_reqs,
+            queued_prefill_tokens=load.queued_prefill_tokens,
+            queued_decode_reqs=load.queued_decode_reqs,
+            prefill_ewma_ms=load.prefill_ewma_ms,
+            oldest_wait_ms=load.oldest_wait_ms,
+        )
+
+    @property
+    def prefill_load(self) -> int:
+        return self.inflight_prefill_tokens + self.queued_prefill_tokens
+
+    @property
+    def is_idle(self) -> bool:
+        return (
+            self.forward_mode == "idle"
+            and not self.prefill_locked
+            and self.num_reqs == 0
+        )
+
+    @property
+    def is_busy(self) -> bool:
+        return not self.is_idle
+
+
+@dataclass
+class BufferedGenerateRequest:
+    req: TokenizedGenerateReqInput
+    arrival_ts: float
+    prefill_cost: int
+    decode_cost: int
+
+
+@dataclass
+class PredictedWorkerState:
+    snapshot: WorkerLoadSnapshot
+    predicted_prefill_finish: int
+    predicted_decode_load: int
+    predicted_num_reqs: int
+
+
+def _estimate_request_input_tokens(req: TokenizedGenerateReqInput) -> int:
+    if req.input_embeds is not None:
+        return len(req.input_embeds)
+    return len(req.input_ids or [])
+
+
+def _estimate_prefill_cost(
+    req: TokenizedGenerateReqInput, chunked_prefill_size: Optional[int]
+) -> int:
+    input_tokens = _estimate_request_input_tokens(req)
+    if chunked_prefill_size is not None and chunked_prefill_size > 0:
+        return min(input_tokens, chunked_prefill_size)
+    return input_tokens
+
+
+def _estimate_decode_cost(req: TokenizedGenerateReqInput) -> int:
+    return _estimate_request_input_tokens(req) + int(req.sampling_params.max_new_tokens)
+
+
+def _compute_percentile(values: List[int], percentile: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return float(values[0])
+
+    values = sorted(values)
+    rank = (len(values) - 1) * percentile
+    lower = int(rank)
+    upper = min(lower + 1, len(values) - 1)
+    weight = rank - lower
+    return values[lower] * (1.0 - weight) + values[upper] * weight
+
+
+def compute_staggered_assignments(
+    buffered_reqs: List[BufferedGenerateRequest],
+    worker_loads: List[WorkerLoadSnapshot],
+    active_status: List[bool],
+    kv_outlier_k: float,
+) -> List[tuple[BufferedGenerateRequest, int]]:
+    predicted_workers = [
+        PredictedWorkerState(
+            snapshot=snapshot,
+            predicted_prefill_finish=snapshot.prefill_load,
+            predicted_decode_load=snapshot.num_tokens,
+            predicted_num_reqs=snapshot.num_reqs,
+        )
+        for snapshot, is_active in zip(worker_loads, active_status)
+        if is_active
+    ]
+
+    if not predicted_workers:
+        return []
+
+    decode_loads = [worker.predicted_decode_load for worker in predicted_workers]
+    q1 = _compute_percentile(decode_loads, 0.25)
+    q3 = _compute_percentile(decode_loads, 0.75)
+    outlier_threshold = q3 + kv_outlier_k * (q3 - q1)
+
+    assignments: List[tuple[BufferedGenerateRequest, int]] = []
+    for item in sorted(
+        buffered_reqs,
+        key=lambda request: (-request.prefill_cost, request.arrival_ts),
+    ):
+        safe_workers = [
+            worker
+            for worker in predicted_workers
+            if worker.predicted_decode_load + item.decode_cost <= outlier_threshold
+        ]
+        candidates = safe_workers or predicted_workers
+        chosen = min(
+            candidates,
+            key=lambda worker: (
+                worker.predicted_prefill_finish,
+                worker.predicted_decode_load,
+                worker.predicted_num_reqs,
+                worker.snapshot.dp_rank,
+            ),
+        )
+        assignments.append((item, chosen.snapshot.dp_rank))
+        chosen.predicted_prefill_finish += item.prefill_cost
+        chosen.predicted_decode_load += item.decode_cost
+        chosen.predicted_num_reqs += 1
+
+    return assignments
+
+
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
@@ -141,11 +295,19 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.STAGGERED_STAGE_AWARE: self.staggered_stage_aware_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
+        self.worker_loads = [WorkerLoadSnapshot(dp_rank=i) for i in range(server_args.dp_size)]
+        self.staggered_buffer: deque[BufferedGenerateRequest] = deque()
+        self.chunked_prefill_size = (
+            server_args.chunked_prefill_size
+            if server_args.chunked_prefill_size and server_args.chunked_prefill_size > 0
+            else None
+        )
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -184,11 +346,32 @@ class DataParallelController:
         for worker in self.workers[:: self.control_message_step]:
             worker.send_pyobj(obj)
 
+    def _send_to_worker(self, target_rank: int, req):
+        self.workers[target_rank].send_pyobj(req)
+
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
+        if (self.load_balance_method == LoadBalanceMethod.STAGGERED_STAGE_AWARE):
+            transitioned_to_idle = False
+            for load in obj.loads:
+                previous = self.worker_loads[load.dp_rank]
+                updated = WorkerLoadSnapshot.from_load(load)
+                transitioned_to_idle |= previous.is_busy and updated.is_idle
+                self.worker_loads[load.dp_rank] = updated
+
+            if (
+                transitioned_to_idle
+                and self.staggered_buffer
+            ):
+                self.maybe_flush_staggered_buffer(force=True)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.status = ranks.status
+        if (
+            self.load_balance_method == LoadBalanceMethod.STAGGERED_STAGE_AWARE
+            and self.staggered_buffer
+        ):
+            self.maybe_flush_staggered_buffer(force=True)
 
     def dispatching_with_trace(self, req: Req):
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
@@ -507,7 +690,7 @@ class DataParallelController:
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
-            self.workers[req.routed_dp_rank].send_pyobj(req)
+            self._send_to_worker(req.routed_dp_rank, req)
             return True
         return False
 
@@ -518,7 +701,7 @@ class DataParallelController:
         while True:
             if self.status[self.round_robin_counter]:
                 logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
+                self._send_to_worker(self.round_robin_counter, req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
                 )
@@ -546,19 +729,84 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        self.workers[target_rank].send_pyobj(req)
+        self._send_to_worker(target_rank, req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.workers[target_worker].send_pyobj(req)
+        self._send_to_worker(target_worker, req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
-        self.workers[target_worker].send_pyobj(req)
+        self._send_to_worker(target_worker, req)
+
+    def staggered_stage_aware_scheduler(self, req: TokenizedGenerateReqInput):
+        if not isinstance(req, TokenizedGenerateReqInput):
+            self.round_robin_scheduler(req)
+            return
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        self.staggered_buffer.append(
+            BufferedGenerateRequest(
+                req=req,
+                arrival_ts=time.perf_counter(),
+                prefill_cost=_estimate_prefill_cost(req, self.chunked_prefill_size),
+                decode_cost=_estimate_decode_cost(req),
+            )
+        )
+        self.maybe_flush_staggered_buffer()
+
+    def _compute_staggered_wait_ms(self) -> float:
+        active_workers = max(1, sum(self.status))
+        ewmas = [
+            snapshot.prefill_ewma_ms
+            for snapshot, is_active in zip(self.worker_loads, self.status)
+            if is_active and snapshot.prefill_ewma_ms > 0
+        ]
+        if ewmas:
+            wait_ms = sum(ewmas) / len(ewmas) / active_workers
+        else:
+            wait_ms = 0.5
+        return max(0.5, min(wait_ms, self.server_args.staggered_max_wait_ms))
+
+    def should_flush_staggered_buffer(self, force: bool = False) -> bool:
+        if not self.staggered_buffer:
+            return False
+        if force:
+            return True
+
+        oldest_wait_ms = (time.perf_counter() - self.staggered_buffer[0].arrival_ts) * 1000.0
+        if oldest_wait_ms >= self._compute_staggered_wait_ms():
+            return True
+        if len(self.staggered_buffer) >= 2 * self.server_args.dp_size:
+            return True
+        if self.chunked_prefill_size is not None:
+            total_prefill_cost = sum(item.prefill_cost for item in self.staggered_buffer)
+            if total_prefill_cost >= self.server_args.dp_size * self.chunked_prefill_size:
+                return True
+        return False
+
+    def maybe_flush_staggered_buffer(self, force: bool = False) -> bool:
+        if not self.should_flush_staggered_buffer(force=force):
+            return False
+
+        assignments = compute_staggered_assignments(
+            buffered_reqs=list(self.staggered_buffer),
+            worker_loads=self.worker_loads,
+            active_status=self.status,
+            kv_outlier_k=self.server_args.staggered_kv_outlier_k,
+        )
+        if not assignments:
+            return False
+
+        self.staggered_buffer.clear()
+        for item, target_rank in assignments:
+            self._send_to_worker(target_rank, item.req)
+        return True
 
     def event_loop(self):
         while True:
@@ -569,6 +817,8 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
+            if self.load_balance_method == LoadBalanceMethod.STAGGERED_STAGE_AWARE:
+                self.maybe_flush_staggered_buffer()
 
 
 def run_data_parallel_controller_process(

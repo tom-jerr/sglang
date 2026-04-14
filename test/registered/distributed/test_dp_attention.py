@@ -224,5 +224,48 @@ class TestDPAttentionDP2TP2VLM(CustomTestCase):
         self.assertGreater(len(response_json["output_ids"]), 0)
 
 
+class TestDPAttentionDP2TP2StaggeredStageAware(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "2",
+                "--enable-dp-attention",
+                "--dp",
+                "2",
+                "--load-balance-method",
+                "staggered_stage_aware",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_simple_generate(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Give me a one-word answer: sky color?",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 8,
+                },
+            },
+        )
+        response.raise_for_status()
+        response_json = response.json()
+        self.assertIn("text", response_json)
+        self.assertGreater(len(response_json["text"]), 0)
+        self.assertIn("output_ids", response_json)
+
+
 if __name__ == "__main__":
     unittest.main()
