@@ -2,7 +2,7 @@ import dataclasses
 import types
 import unittest
 from array import array
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -12,7 +12,10 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
+from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.srt.utils.common import Range  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -113,6 +116,81 @@ class TestMergeBatchOutOfPlace(unittest.TestCase):
 
 
 class TestMixWithRunningOutOfPlace(unittest.TestCase):
+    def test_spec_decode_reserve_handles_unpublished_overlap_kv(self):
+        batch = ScheduleBatch(
+            reqs=[types.SimpleNamespace(kv=None, kv_committed_len=17)],
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+            token_to_kv_pool_allocator=types.SimpleNamespace(page_size=4),
+        )
+
+        with patch(
+            "sglang.srt.managers.schedule_batch.get_alloc_reserve_per_decode",
+            return_value=7,
+        ):
+            self.assertEqual(batch.new_tokens_required_next_decode(), 8)
+
+    def test_spec_mixed_resolves_future_relay_only_for_verify_child(self):
+        prefill = ScheduleBatch(
+            reqs=[],
+            device="cpu",
+            enable_overlap=True,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+            prefill_input_ids_cpu=torch.tensor([1, 2]),
+            spec_info=types.SimpleNamespace(kind="draft_extend_without_future_indices"),
+        )
+        verify = ScheduleBatch(
+            reqs=[],
+            device="cpu",
+            enable_overlap=True,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+            input_ids=torch.tensor([3]),
+            spec_info=types.SimpleNamespace(future_indices=torch.tensor([0])),
+        )
+        parent = ScheduleBatch(
+            reqs=[],
+            spec_mixed_prefill_batch=prefill,
+            spec_mixed_verify_batch=verify,
+        )
+        future_map = types.SimpleNamespace(
+            spec_algo=SpeculativeAlgorithm.EAGLE3,
+            _resolve_spec_extras=MagicMock(),
+        )
+
+        resolve_forward_inputs(parent, future_map)
+
+        self.assertTrue(torch.equal(prefill.input_ids, torch.tensor([1, 2])))
+        future_map._resolve_spec_extras.assert_called_once_with(verify)
+
+    def test_spec_mixed_child_snapshots_do_not_inherit_previous_children(self):
+        common = dict(
+            model_config=types.SimpleNamespace(is_encoder_decoder=False),
+            sampling_info=MagicMock(),
+            return_logprob=False,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+            spec_info=None,
+        )
+        prefill = make_schedule_batch(
+            1,
+            reqs=[types.SimpleNamespace(rid="p")],
+            forward_mode=ForwardMode.EXTEND,
+            **common,
+        )
+        running = make_schedule_batch(
+            1,
+            reqs=[types.SimpleNamespace(rid="r")],
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            **common,
+        )
+        running.spec_mixed_prefill_batch = types.SimpleNamespace(stale=True)
+        running.spec_mixed_verify_batch = types.SimpleNamespace(stale=True)
+
+        prefill.mix_with_spec_running(running)
+
+        self.assertIsNone(prefill.spec_mixed_prefill_batch.spec_mixed_prefill_batch)
+        self.assertIsNone(prefill.spec_mixed_prefill_batch.spec_mixed_verify_batch)
+        self.assertIsNone(prefill.spec_mixed_verify_batch.spec_mixed_prefill_batch)
+        self.assertIsNone(prefill.spec_mixed_verify_batch.spec_mixed_verify_batch)
+
     def test_mix_with_running_rebinds_extend_fields_without_mutating_either_side(self):
         """mix_with_running must append via rebound lists; no field of either side may be mutated in place."""
         extend_batch = make_schedule_batch(
@@ -230,6 +308,82 @@ class TestPrepareEncoderInfoExtendOutOfPlace(unittest.TestCase):
         self.assertIsNot(batch.extend_lens, extend_before)
         self.assertIsNot(batch.extend_logprob_start_lens, logprob_start_before)
         _assert_snapshot_not_mutated(self, snapshot)
+
+
+class TestSpecMixedAdmission(unittest.TestCase):
+    @patch("sglang.srt.managers.scheduler.time.monotonic", return_value=100.0)
+    @patch("sglang.srt.managers.scheduler.get_spec")
+    def test_tiny_prefix_hit_uses_pure_prefill_while_decode_has_slack(
+        self, get_spec_mock, _monotonic_mock
+    ):
+        get_spec_mock.return_value = types.SimpleNamespace(
+            speculative_num_draft_tokens=4
+        )
+        scheduler = object.__new__(Scheduler)
+        scheduler._spec_mixed_decode_service_ewma_s = 0.010
+        scheduler._spec_mixed_last_decode_completion_s = 99.995
+        new_batch = types.SimpleNamespace(
+            reqs=[
+                types.SimpleNamespace(
+                    extend_range=Range(0, 2), prefix_indices=[0] * 1024
+                )
+            ]
+        )
+        running_batch = types.SimpleNamespace(reqs=[object()] * 4)
+
+        self.assertFalse(
+            scheduler._should_mix_spec_prefill(new_batch, running_batch)
+        )
+
+    @patch("sglang.srt.managers.scheduler.time.monotonic", return_value=100.0)
+    @patch("sglang.srt.managers.scheduler.get_spec")
+    def test_tiny_prefix_hit_mixes_when_decode_deadline_is_exhausted(
+        self, get_spec_mock, _monotonic_mock
+    ):
+        get_spec_mock.return_value = types.SimpleNamespace(
+            speculative_num_draft_tokens=4
+        )
+        scheduler = object.__new__(Scheduler)
+        scheduler._spec_mixed_decode_service_ewma_s = 0.010
+        scheduler._spec_mixed_last_decode_completion_s = 99.950
+        new_batch = types.SimpleNamespace(
+            reqs=[
+                types.SimpleNamespace(
+                    extend_range=Range(0, 2), prefix_indices=[0] * 1024
+                )
+            ]
+        )
+        running_batch = types.SimpleNamespace(reqs=[object()] * 4)
+
+        self.assertTrue(scheduler._should_mix_spec_prefill(new_batch, running_batch))
+
+    def test_non_tiny_suffix_keeps_existing_mixed_path(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler._spec_mixed_decode_service_ewma_s = None
+        scheduler._spec_mixed_last_decode_completion_s = 0.0
+        new_batch = types.SimpleNamespace(
+            reqs=[
+                types.SimpleNamespace(
+                    extend_range=Range(0, 8), prefix_indices=[0] * 1024
+                )
+            ]
+        )
+        running_batch = types.SimpleNamespace(reqs=[object()] * 4)
+
+        self.assertTrue(scheduler._should_mix_spec_prefill(new_batch, running_batch))
+
+    def test_tiny_uncached_prompt_keeps_existing_mixed_path(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler._spec_mixed_decode_service_ewma_s = None
+        scheduler._spec_mixed_last_decode_completion_s = 0.0
+        new_batch = types.SimpleNamespace(
+            reqs=[
+                types.SimpleNamespace(extend_range=Range(0, 2), prefix_indices=[])
+            ]
+        )
+        running_batch = types.SimpleNamespace(reqs=[object()] * 4)
+
+        self.assertTrue(scheduler._should_mix_spec_prefill(new_batch, running_batch))
 
 
 if __name__ == "__main__":

@@ -473,6 +473,8 @@ def run_eagle_verify(
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
     grammar_barrier=None,
+    prepared_verify_forward_batch: Optional[ForwardBatch] = None,
+    precomputed_forward_batch_output: Optional[GenerationBatchResult] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -492,21 +494,32 @@ def run_eagle_verify(
 
     bs = len(batch.seq_lens)
 
-    # Batch 1: Target verify
-    # Prepare for target verify in a separate stream
-    with plan_stream_ctx:
-        verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
-            verify_input,
-            req_to_token_pool,
-            batch,
-            target_worker,
+    has_precomputed_target = precomputed_forward_batch_output is not None
+    if has_precomputed_target != (prepared_verify_forward_batch is not None):
+        raise ValueError(
+            "Prepared verify batch and precomputed target output must be provided together"
         )
+
+    if has_precomputed_target:
+        verify_forward_batch = prepared_verify_forward_batch
+        forward_batch_output = precomputed_forward_batch_output
+        can_run_cuda_graph = False
+    else:
+        # Batch 1: Target verify
+        # Prepare for target verify in a separate stream
+        with plan_stream_ctx:
+            verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
+                verify_input,
+                req_to_token_pool,
+                batch,
+                target_worker,
+            )
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
     record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
 
     # Correct some buffers due to the overlap plan
-    if plan_stream:
+    if plan_stream and not has_precomputed_target:
         torch.get_device_module(device).current_stream().wait_stream(plan_stream)
         if (
             _is_npu
@@ -544,7 +557,7 @@ def run_eagle_verify(
         else None
     )
 
-    if metadata_ready_pre_pad:
+    if metadata_ready_pre_pad and not has_precomputed_target:
         # Multi-layer eagle preserved-verbatim behavior: metadata init is
         # skipped here unconditionally, although eagle_prepare_for_verify
         # only plans when cuda-graph load_batch ran. Single-layer eagle
@@ -560,11 +573,12 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
-    forward_batch_output = target_worker.forward_batch_generation(
-        batch=None,
-        forward_batch=verify_forward_batch,
-        is_verify=True,
-    )
+    if not has_precomputed_target:
+        forward_batch_output = target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+        )
     logits_output = forward_batch_output.logits_output
 
     # Generate vocab mask for constrained decoding

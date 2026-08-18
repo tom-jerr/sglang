@@ -9052,10 +9052,21 @@ class ServerArgs:
         self.check_lora_server_args()
 
         # Check speculative decoding
-        if self.speculative_algorithm is not None:
+        if self.speculative_algorithm is not None and self.enable_mixed_chunk:
+            assert self.speculative_algorithm in (
+                "EAGLE",
+                "EAGLE3",
+            ), "enable_mixed_chunk currently supports only EAGLE/EAGLE3 speculative decoding"
             assert (
-                not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
+                self.speculative_eagle_topk == 1
+            ), "enable_mixed_chunk with speculative decoding requires topk=1"
+            assert self.attention_backend in (
+                "triton",
+                "fa3",
+            ), (
+                "enable_mixed_chunk with speculative decoding requires the "
+                "Triton or FA3 target backend"
+            )
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).

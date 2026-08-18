@@ -40,6 +40,7 @@ from __future__ import annotations
 import copy
 import inspect
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
@@ -1079,6 +1080,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        # Heterogeneous prefill+verify relies on attention being an eager graph
+        # break with live composite metadata. Full and tc-piecewise graphs bake
+        # one homogeneous attention topology into the capture and are unsafe.
+        if forward_batch.composition is not None:
+            if (
+                os.environ.get("SGLANG_DISABLE_SPEC_MIXED_CUDA_GRAPH", "0") == "1"
+                or os.environ.get("SGLANG_SPEC_MIXED_OPERATOR_PARITY", "0") == "1"
+            ):
+                return False
+            if not isinstance(self.backend, BreakableCudaGraphBackend):
+                return False
+
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
@@ -1548,6 +1561,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_return_pooled_hidden_states
                 or forward_batch.return_pooled_hidden_states
             ),
+            # BCG captures only the token-shaped transformer segments. Its
+            # attention breaks and eager logits tail must see the current
+            # request segmentation at replay time.
+            composition=forward_batch.composition,
         )
         if self._is_full_backend:
             forward_batch.next_token_logits_buffer = (

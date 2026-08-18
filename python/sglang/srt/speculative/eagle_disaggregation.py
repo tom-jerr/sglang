@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.layers.attention.dsa.utils import (
     should_remap_pd_dsa_seed_to_local_slots,
 )
@@ -97,11 +96,29 @@ def build_eagle_disagg_draft_input(
     if batch.enable_overlap:
         spec_info.future_dsa_topk_indices_available = dsa_topk_indices is not None
         spec_info.future_indices = batch.req_pool_indices
+        rows = batch.req_pool_indices_cpu.to(torch.int64)
+        if future_map.relay_tickets_enabled:
+            spec_info.future_indices_cpu = rows.clone()
+            spec_info.future_generations = batch.req_to_token_pool.req_generation[
+                rows
+            ].clone()
+            spec_info.future_producer_forwards = torch.full_like(rows, -1)
+            spec_info.future_producer_modes = ["disagg_seed"] * len(rows)
         # Seed the relay buf with the known seq_lens; publish's chained record
         # keeps the in-flight forward's fence intact (see FutureMap.publish).
-        future_map.publish(spec_info.future_indices, batch.seq_lens)
+        future_map.publish(
+            spec_info.future_indices,
+            batch.seq_lens,
+            future_indices_cpu=(rows if future_map.relay_tickets_enabled else None),
+            generations=spec_info.future_generations,
+            producer_forwards=spec_info.future_producer_forwards,
+        )
         future_map.stash(
-            spec_info.future_indices, RelayPayload.from_draft_input(spec_info)
+            spec_info.future_indices,
+            RelayPayload.from_draft_input(spec_info),
+            future_indices_cpu=(rows if future_map.relay_tickets_enabled else None),
+            generations=spec_info.future_generations,
+            producer_forwards=spec_info.future_producer_forwards,
         )
 
     return spec_info

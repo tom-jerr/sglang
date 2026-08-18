@@ -34,6 +34,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.speculative.parity import maybe_record_attention
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -107,6 +108,70 @@ class ForwardMetadata:
     # PHYSICAL full-attn write target for the unified pool (eager: translated tensor;
     # cuda-graph: capture-stable buffer view). None for non-unified pools.
     out_cache_loc_full_physical: Optional[torch.Tensor] = None
+
+
+@dataclass
+class CompositePrefillVerifyMetadata:
+    prefill: ForwardMetadata
+    verify: ForwardMetadata
+    prefill_num_tokens: int
+    verify_num_tokens: int
+
+
+@dataclass(frozen=True)
+class ForwardMetadataScratch:
+    kv_indptr: torch.Tensor
+    qo_indptr: torch.Tensor
+    mask_indptr: torch.Tensor
+    kv_indices: Optional[torch.Tensor] = None
+
+
+@dataclass
+class CompositeForwardMetadataScratch:
+    int32_indptr: torch.Tensor
+    int64_indptr: torch.Tensor
+    kv_indices: Optional[torch.Tensor] = None
+
+    def segments(
+        self, prefill_kv_capacity: int, verify_kv_capacity: int
+    ) -> tuple[ForwardMetadataScratch, ForwardMetadataScratch]:
+        """Return disjoint capacity views without inspecting device lengths.
+
+        The actual used length is encoded by the GPU-built kv_indptr.  Capacity
+        is deliberately derived from host-known batch shape and max context, so
+        Triton metadata planning never needs a seq-len scalar D2H.
+        """
+        required = prefill_kv_capacity + verify_kv_capacity
+        if required < 0:
+            raise ValueError("KV-index arena lengths must be non-negative")
+        if self.kv_indices is None or self.kv_indices.numel() < required:
+            capacity = 1 if required == 0 else 1 << (required - 1).bit_length()
+            self.kv_indices = torch.empty(
+                capacity,
+                dtype=torch.int64,
+                device=self.int32_indptr.device,
+            )
+        return (
+            self.segment(0, self.kv_indices[:prefill_kv_capacity]),
+            self.segment(
+                1,
+                self.kv_indices[
+                    prefill_kv_capacity : prefill_kv_capacity + verify_kv_capacity
+                ],
+            ),
+        )
+
+    def segment(
+        self, index: int, kv_indices: Optional[torch.Tensor] = None
+    ) -> ForwardMetadataScratch:
+        if index not in (0, 1):
+            raise ValueError(f"Composition scratch segment must be 0 or 1, got {index}")
+        return ForwardMetadataScratch(
+            kv_indptr=self.int32_indptr[index],
+            qo_indptr=self.int64_indptr[index * 2],
+            mask_indptr=self.int64_indptr[index * 2 + 1],
+            kv_indices=kv_indices,
+        )
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -302,16 +367,31 @@ class TritonAttnBackend(AttentionBackend):
             else:
                 self.window_kv_indptr = torch.zeros_like(kv_indptr_buf)
 
-        if not self.skip_prefill:
-            self.qo_indptr = torch.zeros(
-                (max_bs + 1,), dtype=torch.int64, device=model_runner.device
-            )
+        # Keep these tiny indptr buffers available even on decode-only
+        # multi-step draft backends.  _build_forward_metadata selects its
+        # branch after binding the scratch pointers; omitting the attributes
+        # made the eager (CUDA-graph-disabled) draft path fail before it could
+        # reach the decode branch.  Per-step ownership also avoids borrowing a
+        # graph buffer whose lifetime may overlap the next planning pass.
+        self.qo_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int64, device=model_runner.device
+        )
 
-            self.mask_indptr = torch.zeros(
-                (max_bs + 1,), dtype=torch.int64, device=model_runner.device
-            )
+        self.mask_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int64, device=model_runner.device
+        )
 
         self.forward_metadata: ForwardMetadata = None
+        self.forward_composition_metadata: Optional[CompositePrefillVerifyMetadata] = (
+            None
+        )
+        # Two slots keep the next planning pass from overwriting indptr storage
+        # that the current forward may still consume. Each slot owns one storage
+        # per dtype and exposes disjoint prefill/verify views.
+        self._composition_scratch_slots: Optional[
+            List[CompositeForwardMetadataScratch]
+        ] = None
+        self._composition_scratch_cursor = 0
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
@@ -328,6 +408,62 @@ class TritonAttnBackend(AttentionBackend):
             Lq=head_dim, Lv=head_dim
         )
         self.extend_attention_block_m = block_m
+
+    def supports_forward_composition(
+        self, kind: str, *, topk: int, fixed_q_len: int
+    ) -> bool:
+        return (
+            kind == "prefill_spec_verify"
+            and topk == 1
+            and fixed_q_len > 0
+            and self.dcp_size == 1
+            and not (
+                self.sliding_window_size is not None and self.sliding_window_size > 0
+            )
+        )
+
+    def _acquire_forward_composition_scratch(
+        self,
+    ) -> CompositeForwardMetadataScratch:
+        if self._composition_scratch_slots is None:
+            capacity = self.kv_indptr.shape[0]
+            self._composition_scratch_slots = [
+                CompositeForwardMetadataScratch(
+                    # Indptr builders write cumulative values into [1:], just
+                    # like the backend's long-lived zero-initialized buffers.
+                    # Keep element zero permanently initialized in every row.
+                    int32_indptr=torch.zeros(
+                        (2, capacity),
+                        dtype=torch.int32,
+                        device=self.kv_indptr.device,
+                    ),
+                    int64_indptr=torch.zeros(
+                        (4, capacity),
+                        dtype=torch.int64,
+                        device=self.kv_indptr.device,
+                    ),
+                )
+                for _ in range(2)
+            ]
+        scratch = self._composition_scratch_slots[self._composition_scratch_cursor]
+        self._composition_scratch_cursor = (self._composition_scratch_cursor + 1) % len(
+            self._composition_scratch_slots
+        )
+        return scratch
+
+    def _kv_indices_buffer(
+        self,
+        length: int,
+        scratch: Optional[ForwardMetadataScratch],
+    ) -> torch.Tensor:
+        if scratch is None or scratch.kv_indices is None:
+            return torch.empty(length, dtype=torch.int64, device=self.device)
+        if scratch.kv_indices.numel() < length:
+            raise ValueError(
+                "Forward metadata scratch KV-index view is too small: "
+                f"{scratch.kv_indices.numel()} < {length}"
+            )
+        return scratch.kv_indices[:length]
 
     def get_num_kv_splits(
         self,
@@ -417,8 +553,11 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         kv_indices: torch.Tensor,
+        kv_indptr_scratch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        kv_indptr = self.kv_indptr[: bs + 1]
+        if kv_indptr_scratch is None:
+            kv_indptr_scratch = self.kv_indptr
+        kv_indptr = kv_indptr_scratch[: bs + 1]
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
         create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,
@@ -739,8 +878,72 @@ class TritonAttnBackend(AttentionBackend):
         )
         return self.cuda_graph_out_cache_loc_full_physical[:n]
 
+    def _init_forward_composition_metadata(self, forward_batch: ForwardBatch) -> None:
+        composition = forward_batch.composition
+        assert composition is not None
+        parent_num_tokens = forward_batch.input_ids.shape[0]
+        composition.validate(parent_num_tokens)
+        if composition.verify_num_tokens % composition.verify_batch.batch_size != 0:
+            raise ValueError("Triton composition requires a fixed verify width")
+        fixed_q_len = (
+            composition.verify_num_tokens // composition.verify_batch.batch_size
+        )
+        if not self.supports_forward_composition(
+            composition.kind,
+            topk=self.topk,
+            fixed_q_len=fixed_q_len,
+        ):
+            raise NotImplementedError(
+                "Triton forward composition requires topk=1, fixed verify width, "
+                "DCP=1, non-deterministic attention, and no sliding window"
+            )
+        scratch = self._acquire_forward_composition_scratch()
+        # GPU-only planning: use a safe, host-known capacity.  The ragged
+        # builders write the actual used extent into kv_indptr on the device.
+        # Slots grow only when request count grows and are then reused.
+        prefill_scratch, verify_scratch = scratch.segments(
+            composition.prefill_batch.batch_size * self.max_context_len,
+            composition.verify_batch.batch_size * self.max_context_len,
+        )
+        prefill_metadata = self._build_forward_metadata(
+            composition.prefill_batch, prefill_scratch
+        )
+        verify_metadata = self._build_forward_metadata(
+            composition.verify_batch, verify_scratch
+        )
+        self.forward_composition_metadata = CompositePrefillVerifyMetadata(
+            prefill=prefill_metadata,
+            verify=verify_metadata,
+            prefill_num_tokens=composition.prefill_num_tokens,
+            verify_num_tokens=composition.verify_num_tokens,
+        )
+        # Keep a valid single metadata object for code that inspects the field
+        # between planning and the first layer. The composed forward swaps the
+        # active pointer around each segment call.
+        self.forward_metadata = prefill_metadata
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
+
+        if forward_batch.composition is not None:
+            self._init_forward_composition_metadata(forward_batch)
+            return
+        self.forward_composition_metadata = None
+
+        self.forward_metadata = self._build_forward_metadata(forward_batch)
+
+    def _build_forward_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        scratch: Optional[ForwardMetadataScratch] = None,
+    ) -> ForwardMetadata:
+        """Build one mode's metadata into caller-owned scratch when provided."""
+
+        kv_indptr_scratch = scratch.kv_indptr if scratch is not None else self.kv_indptr
+        qo_indptr_scratch = scratch.qo_indptr if scratch is not None else self.qo_indptr
+        mask_indptr_scratch = (
+            scratch.mask_indptr if scratch is not None else self.mask_indptr
+        )
 
         bs = forward_batch.batch_size
         window_kv_indptr = self.window_kv_indptr
@@ -759,21 +962,20 @@ class TritonAttnBackend(AttentionBackend):
                     kv_indptr, kv_indices, _ = self._dcp_kv_indices(
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
-                        self.kv_indptr,
+                        kv_indptr_scratch,
                     )
                 else:
                     # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
                     seq_lens_sum = forward_batch.seq_lens_sum
                     if seq_lens_sum is None:
                         seq_lens_sum = bs * self.max_context_len
-                    kv_indices = torch.empty(
-                        seq_lens_sum, dtype=torch.int64, device=self.device
-                    )
+                    kv_indices = self._kv_indices_buffer(seq_lens_sum, scratch)
                     kv_indptr = self._fill_kv_indptr_and_indices(
                         bs,
                         forward_batch.seq_lens,
                         forward_batch.req_pool_indices,
                         kv_indices,
+                        kv_indptr_scratch,
                     )
                     if self._translate_kv_loc is not None:
                         kv_indices = self._translate_kv_loc(kv_indices)
@@ -843,25 +1045,41 @@ class TritonAttnBackend(AttentionBackend):
                 and getattr(spec_info, "draft_token_num", None) is not None
             ):
                 num_draft_tokens = int(spec_info.draft_token_num)
-            qo_indptr = torch.arange(
-                0,
-                (1 + bs) * num_draft_tokens,
-                step=num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            )
+            if scratch is None:
+                # Preserve the ordinary TARGET_VERIFY path's independent
+                # storage, dtype and lifetime.  Composition alone uses the
+                # caller-owned persistent scratch below.
+                qo_indptr = torch.arange(
+                    0,
+                    (1 + bs) * num_draft_tokens,
+                    step=num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            else:
+                qo_indptr = qo_indptr_scratch[: bs + 1]
+                torch.arange(
+                    0,
+                    (1 + bs) * num_draft_tokens,
+                    step=num_draft_tokens,
+                    out=qo_indptr,
+                )
             # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
             seq_lens_sum = forward_batch.seq_lens_sum
             if seq_lens_sum is None:
-                seq_lens_sum = bs * self.max_context_len
-            kv_indices = torch.empty(
-                seq_lens_sum, dtype=torch.int64, device=self.device
-            )
+                # Composition receives a safe host-planned capacity view; the
+                # GPU-built kv_indptr carries the actual ragged used length.
+                if scratch is not None and scratch.kv_indices is not None:
+                    seq_lens_sum = scratch.kv_indices.numel()
+                else:
+                    seq_lens_sum = bs * self.max_context_len
+            kv_indices = self._kv_indices_buffer(seq_lens_sum, scratch)
             kv_indptr = self._fill_kv_indptr_and_indices(
                 bs,
                 forward_batch.seq_lens,
                 forward_batch.req_pool_indices,
                 kv_indices,
+                kv_indptr_scratch,
             )
 
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
@@ -886,7 +1104,7 @@ class TritonAttnBackend(AttentionBackend):
             seq_mask_len = num_draft_tokens * (
                 forward_batch.seq_lens + num_draft_tokens
             )
-            mask_indptr = self.mask_indptr
+            mask_indptr = mask_indptr_scratch
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = num_draft_tokens
@@ -899,7 +1117,7 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices, _ = self._dcp_kv_indices(
                     forward_batch.req_pool_indices,
                     forward_batch.extend_prefix_lens,
-                    self.kv_indptr,
+                    kv_indptr_scratch,
                 )
             else:
                 # gpu_only leaves _cpu unset; over-allocate is safe (ragged write).
@@ -907,16 +1125,13 @@ class TritonAttnBackend(AttentionBackend):
                     kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
                 else:
                     kv_indices_len = bs * self.max_context_len
-                kv_indices = torch.empty(
-                    kv_indices_len,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
+                kv_indices = self._kv_indices_buffer(kv_indices_len, scratch)
                 kv_indptr = self._fill_kv_indptr_and_indices(
                     bs,
                     forward_batch.extend_prefix_lens,
                     forward_batch.req_pool_indices,
                     kv_indices,
+                    kv_indptr_scratch,
                 )
                 if self._translate_kv_loc is not None:
                     kv_indices = self._translate_kv_loc(kv_indices)
@@ -937,7 +1152,7 @@ class TritonAttnBackend(AttentionBackend):
                     self.token_to_kv_pool,
                 )
 
-            qo_indptr = self.qo_indptr
+            qo_indptr = qo_indptr_scratch
             qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
@@ -968,7 +1183,7 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.out_cache_loc
             )
 
-        self.forward_metadata = ForwardMetadata(
+        return ForwardMetadata(
             attn_logits,
             attn_lse,
             max_extend_len,
@@ -1286,7 +1501,25 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
         score_mod=None,
         aux_tensors=None,
+        forward_metadata: Optional[ForwardMetadata] = None,
     ):
+        if forward_batch.composition is not None:
+            return self._forward_extend_composition(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                sinks=sinks,
+                score_mod=score_mod,
+                aux_tensors=aux_tensors,
+            )
+
+        active_metadata = (
+            forward_metadata if forward_metadata is not None else self.forward_metadata
+        )
+
         # TODO: reuse the buffer across layers
         attn_out = getattr(forward_batch, "_attn_output", None)
         if attn_out is not None:
@@ -1314,8 +1547,8 @@ class TritonAttnBackend(AttentionBackend):
             if save_kv_cache:
                 loc_info = KVWriteLoc(
                     forward_batch.out_cache_loc,
-                    self.forward_metadata.swa_out_cache_loc,
-                    full_loc=self.forward_metadata.out_cache_loc_full_physical,
+                    active_metadata.swa_out_cache_loc,
+                    full_loc=active_metadata.out_cache_loc_full_physical,
                 )
                 if layer.k_scale is None:
                     self._set_kv_buffer(forward_batch, layer, loc_info, k, v)
@@ -1370,6 +1603,7 @@ class TritonAttnBackend(AttentionBackend):
                 o,
                 layer,
                 forward_batch,
+                active_metadata,
                 causal,
                 logits_soft_cap,
                 sinks,
@@ -1382,13 +1616,13 @@ class TritonAttnBackend(AttentionBackend):
             sliding_window_size = (
                 layer.sliding_window_size
             )  # Needed for sliding window mask
-            kv_indptr = self.forward_metadata.window_kv_indptr
-            kv_indices = self.forward_metadata.window_kv_indices
-            window_kv_offsets = self.forward_metadata.window_kv_offsets
+            kv_indptr = active_metadata.window_kv_indptr
+            kv_indices = active_metadata.window_kv_indices
+            window_kv_offsets = active_metadata.window_kv_offsets
         else:
             sliding_window_size = -1
-            kv_indptr = self.forward_metadata.kv_indptr
-            kv_indices = self.forward_metadata.kv_indices
+            kv_indptr = active_metadata.kv_indptr
+            kv_indices = active_metadata.kv_indices
             window_kv_offsets = None
 
         if layer.k_scale is not None and layer.v_scale is not None:
@@ -1424,13 +1658,13 @@ class TritonAttnBackend(AttentionBackend):
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                 self.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                self.forward_metadata.qo_indptr,
+                active_metadata.qo_indptr,
                 kv_indptr,
                 kv_indices,
-                self.forward_metadata.custom_mask,
+                active_metadata.custom_mask,
                 causal,
-                self.forward_metadata.mask_indptr,
-                self.forward_metadata.max_extend_len,
+                active_metadata.mask_indptr,
+                active_metadata.max_extend_len,
                 k_descale,
                 v_descale,
                 layer.scaling,
@@ -1442,6 +1676,7 @@ class TritonAttnBackend(AttentionBackend):
                 max_bs=self.req_to_token_pool.size,
             )
         ):
+            maybe_record_attention(layer.layer_id, o)
             return o
 
         self.extend_attention_fwd(
@@ -1451,13 +1686,13 @@ class TritonAttnBackend(AttentionBackend):
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            self.forward_metadata.qo_indptr,
+            active_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
-            self.forward_metadata.custom_mask,
+            active_metadata.custom_mask,
             causal,
-            self.forward_metadata.mask_indptr,
-            self.forward_metadata.max_extend_len,
+            active_metadata.mask_indptr,
+            active_metadata.max_extend_len,
             k_descale,
             v_descale,
             layer.scaling,
@@ -1471,7 +1706,90 @@ class TritonAttnBackend(AttentionBackend):
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         )
+        maybe_record_attention(layer.layer_id, o)
         return o
+
+    def _forward_extend_composition(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        sinks=None,
+        score_mod=None,
+        aux_tensors=None,
+    ) -> torch.Tensor:
+        composition = forward_batch.composition
+        metadata = self.forward_composition_metadata
+        if composition is None or metadata is None:
+            raise RuntimeError("Triton composition metadata was not initialized")
+        composition.validate(q.shape[0])
+        if score_mod is not None or aux_tensors is not None:
+            raise NotImplementedError(
+                "Triton forward composition does not support score_mod/aux_tensors"
+            )
+
+        prefill_end = metadata.prefill_num_tokens
+
+        attn_out = getattr(forward_batch, "_attn_output", None)
+        if attn_out is None:
+            if layer.qk_head_dim != layer.v_head_dim:
+                attn_out = q.new_empty(
+                    (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                )
+            else:
+                attn_out = torch.empty_like(q)
+
+        def segment(tensor, start, end):
+            return None if tensor is None else tensor[start:end]
+
+        missing = object()
+        prefill_previous_out = getattr(
+            composition.prefill_batch, "_attn_output", missing
+        )
+        verify_previous_out = getattr(composition.verify_batch, "_attn_output", missing)
+        composition.prefill_batch._attn_output = attn_out[:prefill_end]
+        composition.verify_batch._attn_output = attn_out[prefill_end:]
+
+        try:
+            prefill_out = self.forward_extend(
+                q[:prefill_end],
+                segment(k, 0, prefill_end),
+                segment(v, 0, prefill_end),
+                layer,
+                composition.prefill_batch,
+                save_kv_cache=save_kv_cache,
+                sinks=sinks,
+                forward_metadata=metadata.prefill,
+            )
+
+            verify_out = self.forward_extend(
+                q[prefill_end:],
+                segment(k, prefill_end, None),
+                segment(v, prefill_end, None),
+                layer,
+                composition.verify_batch,
+                save_kv_cache=save_kv_cache,
+                sinks=sinks,
+                forward_metadata=metadata.verify,
+            )
+        finally:
+            if prefill_previous_out is missing:
+                del composition.prefill_batch._attn_output
+            else:
+                composition.prefill_batch._attn_output = prefill_previous_out
+            if verify_previous_out is missing:
+                del composition.verify_batch._attn_output
+            else:
+                composition.verify_batch._attn_output = verify_previous_out
+
+        if prefill_out.data_ptr() != attn_out[:prefill_end].data_ptr():
+            raise RuntimeError("Triton prefill composition did not use its output view")
+        if verify_out.data_ptr() != attn_out[prefill_end:].data_ptr():
+            raise RuntimeError("Triton verify composition did not use its output view")
+        return attn_out
 
     def _forward_extend_dcp(
         self,
@@ -1622,6 +1940,7 @@ class TritonAttnBackend(AttentionBackend):
         o: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
+        forward_metadata: ForwardMetadata,
         causal: bool,
         logits_soft_cap: float,
         sinks: Optional[torch.Tensor],
@@ -1638,8 +1957,8 @@ class TritonAttnBackend(AttentionBackend):
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             sliding_window_size = layer.sliding_window_size
             # Note: for unified kernel, we use full kv_indptr (not window)
-            prefix_kv_indptr = self.forward_metadata.window_kv_indptr
-            prefix_kv_indices = self.forward_metadata.window_kv_indices
+            prefix_kv_indptr = forward_metadata.window_kv_indptr
+            prefix_kv_indices = forward_metadata.window_kv_indices
             # Compute window start positions (absolute position of first key in window)
             # window_start_pos = seq_len - window_len
             window_kv_lens = prefix_kv_indptr[1 : bs + 1] - prefix_kv_indptr[:bs]
@@ -1662,8 +1981,8 @@ class TritonAttnBackend(AttentionBackend):
                     window_start_pos = None
         else:
             sliding_window_size = -1
-            prefix_kv_indptr = self.forward_metadata.kv_indptr
-            prefix_kv_indices = self.forward_metadata.kv_indices
+            prefix_kv_indptr = forward_metadata.kv_indptr
+            prefix_kv_indices = forward_metadata.kv_indices
             window_start_pos = None
 
         extend_kv_indices = forward_batch.out_cache_loc
@@ -1676,14 +1995,14 @@ class TritonAttnBackend(AttentionBackend):
         ):
             # Consumes VIRTUAL ids, so it must see out_cache_loc untranslated.
             extend_kv_indices = pool.translate_loc_from_full_to_swa(extend_kv_indices)
-        elif self.forward_metadata.out_cache_loc_full_physical is not None:
+        elif forward_metadata.out_cache_loc_full_physical is not None:
             # Unified pool: this kernel reads the extend half OUT OF THE POOL (the
             # 2-stage path takes it from the k/v arguments), so it needs the same
             # translated loc the KV write uses -- otherwise the prefix is read at
             # physical ids and the extend tokens at virtual ones. Reuse the
             # per-forward translation rather than re-translating: this runs once
             # per layer.
-            extend_kv_indices = self.forward_metadata.out_cache_loc_full_physical
+            extend_kv_indices = forward_metadata.out_cache_loc_full_physical
 
         # Handle cases where extend_seq_lens or extend_start_loc might not be set
         # In speculative decoding, we can infer these from spec_info or compute them
@@ -1746,13 +2065,13 @@ class TritonAttnBackend(AttentionBackend):
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),
             k_descale,
             v_descale,
-            self.forward_metadata.qo_indptr,
+            forward_metadata.qo_indptr,
             unified_kv_indptr,
             unified_kv_indices,
             prefix_lens,
-            self.forward_metadata.max_extend_len,
-            custom_mask=self.forward_metadata.custom_mask,
-            mask_indptr=self.forward_metadata.mask_indptr,
+            forward_metadata.max_extend_len,
+            custom_mask=forward_metadata.custom_mask,
+            mask_indptr=forward_metadata.mask_indptr,
             sm_scale=layer.scaling,
             logit_cap=logits_soft_cap,
             is_causal=causal,
@@ -1765,6 +2084,7 @@ class TritonAttnBackend(AttentionBackend):
             aux_tensors=aux_tensors,
         )
 
+        maybe_record_attention(layer.layer_id, o)
         return o
 
     def forward_decode(

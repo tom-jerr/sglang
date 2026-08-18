@@ -125,6 +125,12 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
+    def supports_forward_composition(
+        self, kind: str, *, topk: int, fixed_q_len: int
+    ) -> bool:
+        """Whether this backend can execute a heterogeneous packed forward."""
+        return False
+
     def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
         """Declare where this backend's scheduler-shared reads end per mode.
 

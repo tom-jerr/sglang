@@ -28,8 +28,9 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import copy
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
@@ -409,6 +410,160 @@ class NgramEmbeddingInfo:
 
 
 @dataclass
+class ForwardCompositionTensorScratch:
+    """Grow-only tensor arena for one in-flight packed composition."""
+
+    buffers: Dict[str, torch.Tensor] = field(default_factory=dict)
+
+    def tensor(
+        self,
+        name: str,
+        shape: Tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        device = torch.device(device)
+        buf = self.buffers.get(name)
+        if len(shape) == 0:
+            required_shape = shape
+            reusable = (
+                buf is not None
+                and buf.shape == required_shape
+                and buf.dtype == dtype
+                and buf.device == device
+            )
+            if not reusable:
+                buf = torch.empty(required_shape, dtype=dtype, device=device)
+                self.buffers[name] = buf
+            return buf
+
+        length = shape[0]
+        capacity = 1 if length == 0 else 1 << (length - 1).bit_length()
+        reusable = (
+            buf is not None
+            and buf.ndim == len(shape)
+            and buf.shape[1:] == shape[1:]
+            and buf.shape[0] >= length
+            and buf.dtype == dtype
+            and buf.device == device
+        )
+        if not reusable:
+            buf = torch.empty(
+                (capacity, *shape[1:]), dtype=dtype, device=device
+            )
+            self.buffers[name] = buf
+        return buf[:length]
+
+    def pack(self, name: str, tensors: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        if not tensors:
+            raise ValueError("Composition scratch pack needs at least one tensor")
+        first = tensors[0]
+        length = sum(t.shape[0] for t in tensors)
+        out = self.tensor(
+            name,
+            (length, *first.shape[1:]),
+            dtype=first.dtype,
+            device=first.device,
+        )
+        offset = 0
+        destinations = []
+        for tensor in tensors:
+            next_offset = offset + tensor.shape[0]
+            destinations.append(out[offset:next_offset])
+            offset = next_offset
+        torch._foreach_copy_(destinations, tensors)
+        return out
+
+
+@dataclass(slots=True)
+class ForwardComposition:
+    """Runtime views for a heterogeneous packed target forward.
+
+    The parent ForwardBatch owns the packed token tensors. Segment batches are
+    non-owning views with the exact request/token metadata expected by their
+    existing attention modes. Keeping the views explicit lets a backend reuse
+    its proven EXTEND and TARGET_VERIFY implementations without teaching every
+    metadata field about heterogeneous row semantics.
+    """
+
+    kind: str
+    prefill_batch: "ForwardBatch"
+    verify_batch: "ForwardBatch"
+    prefill_num_tokens: int
+    verify_num_tokens: int
+    logits_gather_indices: Optional[torch.Tensor] = None
+    tensor_scratch: Optional[ForwardCompositionTensorScratch] = None
+
+    def validate(self, parent_num_tokens: int) -> None:
+        if self.kind != "prefill_spec_verify":
+            raise ValueError(f"Unsupported forward composition kind: {self.kind!r}")
+        if self.prefill_num_tokens <= 0 or self.verify_num_tokens <= 0:
+            raise ValueError("Forward composition segments must both be non-empty")
+        if self.prefill_batch.batch_size <= 0 or self.verify_batch.batch_size <= 0:
+            raise ValueError(
+                "Forward composition request segments must both be non-empty"
+            )
+        if self.prefill_num_tokens + self.verify_num_tokens != parent_num_tokens:
+            raise ValueError(
+                "Forward composition token counts do not match the packed batch: "
+                f"{self.prefill_num_tokens} + {self.verify_num_tokens} != "
+                f"{parent_num_tokens}"
+            )
+        if self.prefill_batch.forward_mode != ForwardMode.EXTEND:
+            raise ValueError("The prefill composition segment must use EXTEND mode")
+        if self.verify_batch.forward_mode != ForwardMode.TARGET_VERIFY:
+            raise ValueError(
+                "The speculative verify composition segment must use TARGET_VERIFY mode"
+            )
+        if self.prefill_batch.input_ids.shape[0] != self.prefill_num_tokens:
+            raise ValueError("Prefill segment input_ids do not match its token count")
+        if self.verify_batch.input_ids.shape[0] != self.verify_num_tokens:
+            raise ValueError("Verify segment input_ids do not match its token count")
+
+    def build_logits_gather_indices(
+        self, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Select prefill last-token rows followed by every verify row."""
+        if self.logits_gather_indices is not None:
+            return self.logits_gather_indices
+        extend_seq_lens = self.prefill_batch.extend_seq_lens
+        if extend_seq_lens is None:
+            raise ValueError("Prefill segment needs extend_seq_lens for logits gather")
+        if extend_seq_lens.shape[0] != self.prefill_batch.batch_size:
+            raise ValueError("Prefill extend_seq_lens do not match its batch size")
+        required = self.prefill_batch.batch_size + self.verify_num_tokens
+        if out is None:
+            indices = torch.empty(
+                required,
+                dtype=torch.int64,
+                device=extend_seq_lens.device,
+            )
+        else:
+            if (
+                out.shape != (required,)
+                or out.dtype != torch.int64
+                or out.device != extend_seq_lens.device
+            ):
+                raise ValueError("Composition logits-gather scratch has wrong shape")
+            indices = out
+        torch.cumsum(
+            extend_seq_lens,
+            dim=0,
+            dtype=torch.int64,
+            out=indices[: self.prefill_batch.batch_size],
+        )
+        indices[: self.prefill_batch.batch_size].sub_(1)
+        torch.arange(
+            self.prefill_num_tokens,
+            self.prefill_num_tokens + self.verify_num_tokens,
+            out=indices[self.prefill_batch.batch_size :],
+        )
+        self.logits_gather_indices = indices
+        return indices
+
+
+@dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
 
@@ -505,6 +660,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # Heterogeneous packed-forward runtime views. None for all existing paths.
+    composition: Optional[ForwardComposition] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA
@@ -1767,6 +1924,208 @@ class PPProxyTensors:
 
     def __repr__(self) -> str:
         return f"PPProxyTensors(tensors={self.tensors})"
+
+
+def pack_prefill_and_verify_forward(
+    prefill_batch: ForwardBatch,
+    verify_batch: ForwardBatch,
+    scratch: Optional[ForwardCompositionTensorScratch] = None,
+) -> ForwardBatch:
+    """Build a non-owning composition around one packed target-token buffer."""
+    if scratch is None:
+        scratch = ForwardCompositionTensorScratch()
+    prefill_tokens = prefill_batch.input_ids.shape[0]
+    verify_tokens = verify_batch.input_ids.shape[0]
+    composition = ForwardComposition(
+        kind="prefill_spec_verify",
+        prefill_batch=prefill_batch,
+        verify_batch=verify_batch,
+        prefill_num_tokens=prefill_tokens,
+        verify_num_tokens=verify_tokens,
+        tensor_scratch=scratch,
+    )
+    composition.validate(prefill_tokens + verify_tokens)
+    if prefill_batch.positions is None or verify_batch.positions is None:
+        raise ValueError("Composition segments must have materialized positions")
+    if prefill_batch.out_cache_loc is None or verify_batch.out_cache_loc is None:
+        raise ValueError("Composition segments must have output-cache locations")
+
+    packed = copy.copy(prefill_batch)
+    packed.forward_mode = ForwardMode.MIXED
+    packed.batch_size = prefill_batch.batch_size + verify_batch.batch_size
+    packed.input_ids = scratch.pack(
+        "input_ids", (prefill_batch.input_ids, verify_batch.input_ids)
+    )
+    packed.req_pool_indices = scratch.pack(
+        "req_pool_indices",
+        (prefill_batch.req_pool_indices, verify_batch.req_pool_indices)
+    )
+    packed.seq_lens = scratch.pack(
+        "seq_lens", (prefill_batch.seq_lens, verify_batch.seq_lens)
+    )
+    packed.seq_lens_cpu = (
+        scratch.pack(
+            "seq_lens_cpu",
+            (prefill_batch.seq_lens_cpu, verify_batch.seq_lens_cpu),
+        )
+        if prefill_batch.seq_lens_cpu is not None
+        and verify_batch.seq_lens_cpu is not None
+        else None
+    )
+    packed.out_cache_loc = scratch.pack(
+        "out_cache_loc",
+        (prefill_batch.out_cache_loc, verify_batch.out_cache_loc)
+    )
+    packed.positions = scratch.pack(
+        "positions", (prefill_batch.positions, verify_batch.positions)
+    )
+    packed.seq_lens_sum = (
+        prefill_batch.seq_lens_sum + verify_batch.seq_lens_sum
+        if prefill_batch.seq_lens_sum is not None
+        and verify_batch.seq_lens_sum is not None
+        else None
+    )
+    # A breakable prefill CUDA graph copies all request-axis EXTEND fields into
+    # static buffers before entering the captured body.  Attention itself uses
+    # the two composition views, but those parent fields still have to describe
+    # all E + D requests (rather than aliasing the E-row prefill tensors).
+    # TARGET_VERIFY has a uniform number of draft tokens per request.
+    verify_requests = verify_batch.batch_size
+    if verify_tokens % verify_requests != 0:
+        raise ValueError(
+            "Verify token count must be divisible by its request count: "
+            f"{verify_tokens} % {verify_requests} != 0"
+        )
+    verify_width = verify_tokens // verify_requests
+    if prefill_batch.extend_seq_lens is None:
+        raise ValueError("Prefill composition needs extend_seq_lens")
+    verify_extend_seq_lens = scratch.tensor(
+        "verify_extend_seq_lens",
+        (verify_requests,),
+        dtype=prefill_batch.extend_seq_lens.dtype,
+        device=prefill_batch.extend_seq_lens.device,
+    )
+    verify_extend_seq_lens.fill_(verify_width)
+    packed.extend_seq_lens = scratch.pack(
+        "extend_seq_lens",
+        (prefill_batch.extend_seq_lens, verify_extend_seq_lens),
+    )
+
+    prefill_prefix_lens = prefill_batch.extend_prefix_lens
+    if prefill_prefix_lens is None:
+        prefill_prefix_lens = prefill_batch.seq_lens - prefill_batch.extend_seq_lens.to(
+            dtype=prefill_batch.seq_lens.dtype
+        )
+    packed.extend_prefix_lens = scratch.tensor(
+        "extend_prefix_lens",
+        (packed.batch_size,),
+        dtype=prefill_prefix_lens.dtype,
+        device=prefill_prefix_lens.device,
+    )
+    packed.extend_prefix_lens[: prefill_batch.batch_size].copy_(prefill_prefix_lens)
+    torch.sub(
+        verify_batch.seq_lens,
+        verify_width,
+        out=packed.extend_prefix_lens[prefill_batch.batch_size :],
+    )
+    packed.extend_start_loc = scratch.tensor(
+        "extend_start_loc",
+        (packed.batch_size,),
+        dtype=packed.extend_seq_lens.dtype,
+        device=packed.extend_seq_lens.device,
+    )
+    packed.extend_start_loc[0] = 0
+    torch.cumsum(
+        packed.extend_seq_lens[:-1],
+        dim=0,
+        out=packed.extend_start_loc[1:],
+    )
+
+    prefill_orig_seq_lens = (
+        prefill_batch.orig_seq_lens
+        if prefill_batch.orig_seq_lens is not None
+        else prefill_batch.seq_lens
+    )
+    verify_orig_seq_lens = (
+        verify_batch.orig_seq_lens
+        if verify_batch.orig_seq_lens is not None
+        else verify_batch.seq_lens
+    )
+    packed.orig_seq_lens = scratch.pack(
+        "orig_seq_lens", (prefill_orig_seq_lens, verify_orig_seq_lens)
+    )
+    if prefill_batch.extend_seq_lens_cpu is not None:
+        packed.extend_seq_lens_cpu = [
+            *prefill_batch.extend_seq_lens_cpu,
+            *([verify_width] * verify_requests),
+        ]
+    else:
+        packed.extend_seq_lens_cpu = None
+    if prefill_batch.extend_prefix_lens_cpu is not None:
+        verify_seq_lens_cpu = verify_batch.seq_lens_cpu
+        packed.extend_prefix_lens_cpu = [
+            *prefill_batch.extend_prefix_lens_cpu,
+            *(
+                (verify_seq_lens_cpu - verify_width).tolist()
+                if verify_seq_lens_cpu is not None
+                else []
+            ),
+        ]
+        if len(packed.extend_prefix_lens_cpu) != packed.batch_size:
+            packed.extend_prefix_lens_cpu = None
+    else:
+        packed.extend_prefix_lens_cpu = None
+    packed.extend_logprob_start_lens_cpu = None
+    packed.extend_num_tokens = prefill_tokens + verify_tokens
+    total_tokens = prefill_tokens + verify_tokens
+    packed.num_token_non_padded_cpu = total_tokens
+    if prefill_batch.num_token_non_padded is not None:
+        packed.num_token_non_padded = scratch.tensor(
+            "num_token_non_padded",
+            (),
+            dtype=prefill_batch.num_token_non_padded.dtype,
+            device=prefill_batch.num_token_non_padded.device,
+        )
+        packed.num_token_non_padded.fill_(total_tokens)
+    if prefill_batch.global_num_tokens_cpu is not None:
+        if len(prefill_batch.global_num_tokens_cpu) != 1:
+            raise ValueError("Speculative mixed composition currently requires DP=1")
+        packed.global_num_tokens_cpu = [total_tokens]
+        packed.global_dp_buffer_len = total_tokens
+    for name in (
+        "global_num_tokens_gpu",
+        "global_num_tokens_for_logprob_gpu",
+    ):
+        value = getattr(prefill_batch, name)
+        if value is not None:
+            packed_value = scratch.tensor(
+                name,
+                tuple(value.shape),
+                dtype=value.dtype,
+                device=value.device,
+            )
+            packed_value.fill_(total_tokens)
+            setattr(packed, name, packed_value)
+    if prefill_batch.global_num_tokens_for_logprob_cpu is not None:
+        packed.global_num_tokens_for_logprob_cpu = [total_tokens]
+    packed.capture_hidden_mode = CaptureHiddenMode.FULL
+    packed.return_logprob = False
+    packed.spec_info = None
+    packed.composition = composition
+    gather_out = scratch.tensor(
+        "logits_gather_indices",
+        (prefill_batch.batch_size + verify_tokens,),
+        dtype=torch.int64,
+        device=prefill_batch.input_ids.device,
+    )
+    composition.build_logits_gather_indices(out=gather_out)
+    packed._attn_output = None
+    # The supported composition gate is single-GPU. BCG consumes live backend
+    # metadata at its attention breaks, so the local graph vote is safe for
+    # both Triton and FA3 composition implementations.
+    packed.can_run_dp_cuda_graph = True
+    packed.can_run_dp_breakable_cuda_graph = True
+    return packed
 
 
 def compute_position(

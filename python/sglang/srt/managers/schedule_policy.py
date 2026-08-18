@@ -511,8 +511,9 @@ class PrefillAdder:
         new_token_ratio: float,
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
-        num_mixed_decode_tokens: int = 0,
+        mixed_compute_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
+        mixed_kv_reserve_tokens: Optional[int] = None,
         max_prefill_bs: int = 0,
         max_running_requests: Optional[int] = None,
         prefill_max_requests: Optional[int] = None,
@@ -527,17 +528,31 @@ class PrefillAdder:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
-        self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
+        self.rem_input_tokens = rem_input_tokens - mixed_compute_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
+
+        # Mixed batches have two independent costs:
+        #   * compute tokens consume the forward/chunk token budgets;
+        #   * KV reserve tokens consume allocator capacity.
+        # They happen to be equal for the legacy one-token decode path on a
+        # page-size-1 pool, but speculative verify and preallocated/page-aligned
+        # decode make them diverge. Keep None backward-compatible for callers
+        # that have not migrated to explicit allocator-derived accounting.
+        if mixed_kv_reserve_tokens is None:
+            mixed_kv_reserve_tokens = mixed_compute_tokens
+        if mixed_compute_tokens < 0:
+            raise ValueError("mixed_compute_tokens must be non-negative")
+        if mixed_kv_reserve_tokens < 0:
+            raise ValueError("mixed_kv_reserve_tokens must be non-negative")
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
 
         if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= num_mixed_decode_tokens
-        self.rem_total_token_offset = num_mixed_decode_tokens
-        self.cur_rem_token_offset = num_mixed_decode_tokens
+            self.rem_chunk_tokens -= mixed_compute_tokens
+        self.rem_total_token_offset = mixed_kv_reserve_tokens
+        self.cur_rem_token_offset = mixed_kv_reserve_tokens
 
         self.req_states = None
         self.can_run_list = []

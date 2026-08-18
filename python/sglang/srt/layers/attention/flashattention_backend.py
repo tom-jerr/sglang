@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
-
 from sglang.kernels.ops.attention.metadata import (
     draft_extend_set_metadata,
     normal_decode_set_metadata,
@@ -31,6 +30,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.speculative.parity import maybe_record_attention
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -42,7 +42,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
-
 from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
@@ -117,6 +116,16 @@ class FlashAttentionMetadata:
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
 
+@dataclass
+class CompositePrefillVerifyFlashAttentionMetadata:
+    """The two independent FA metadata plans owned by one packed forward."""
+
+    prefill: FlashAttentionMetadata
+    verify: FlashAttentionMetadata
+    prefill_num_tokens: int
+    verify_num_tokens: int
+
+
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
 
@@ -160,6 +169,9 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.forward_metadata: FlashAttentionMetadata = None
+        self.forward_composition_metadata: Optional[
+            CompositePrefillVerifyFlashAttentionMetadata
+        ] = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
@@ -354,6 +366,29 @@ class FlashAttentionBackend(AttentionBackend):
         # scheduler_metadata unset uses the existing per-layer metadata path.
         self._disable_scheduler_metadata_precompute = (
             _should_disable_scheduler_metadata_precompute(server_args)
+        )
+
+    def supports_forward_composition(
+        self, kind: str, *, topk: int, fixed_q_len: int
+    ) -> bool:
+        """Whether FA3 can execute prefill + target-verify in one model pass.
+
+        The attention kernels still run as two ordinary ``forward_extend`` calls.
+        The gate deliberately starts with the MHA configuration exercised by the
+        mixed EAGLE path; the excluded architectures need additional per-segment
+        state beyond the two metadata objects introduced here.
+        """
+        return (
+            self.fa_impl_ver == 3
+            and kind == "prefill_spec_verify"
+            and topk == 1
+            and fixed_q_len > 0
+            and self.attn_cp_size == 1
+            and not self.use_mla
+            and not self.has_local_attention
+            and not self.has_swa
+            and not self.is_encoder_decoder
+            and not self.fa_skip_kv_cache
         )
 
     def _compute_scheduler_metadata(
@@ -667,8 +702,63 @@ class FlashAttentionBackend(AttentionBackend):
             m.max_seq_len_k = self.max_context_len
         self.forward_metadata = m
 
+    def _init_forward_composition_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        composition = forward_batch.composition
+        assert composition is not None
+        composition.validate(forward_batch.input_ids.shape[0])
+        if composition.verify_num_tokens % composition.verify_batch.batch_size != 0:
+            raise ValueError("FA3 composition requires a fixed verify width")
+        fixed_q_len = (
+            composition.verify_num_tokens // composition.verify_batch.batch_size
+        )
+        if not self.supports_forward_composition(
+            composition.kind,
+            topk=self.topk,
+            fixed_q_len=fixed_q_len,
+        ):
+            raise NotImplementedError(
+                "FA3 forward composition requires MHA, topk=1, fixed verify "
+                "width, CP=1, and no SWA/local/cross attention"
+            )
+        if fixed_q_len != self.speculative_num_draft_tokens:
+            raise ValueError(
+                "FA3 composition verify width does not match the configured "
+                "speculative token count"
+            )
+
+        prefill_metadata = self._build_forward_metadata(composition.prefill_batch)
+        verify_metadata = self._build_forward_metadata(composition.verify_batch)
+        self.forward_composition_metadata = (
+            CompositePrefillVerifyFlashAttentionMetadata(
+                prefill=prefill_metadata,
+                verify=verify_metadata,
+                prefill_num_tokens=composition.prefill_num_tokens,
+                verify_num_tokens=composition.verify_num_tokens,
+            )
+        )
+        # Keep this field valid for generic code that inspects the active backend
+        # after planning. Segment forwards receive their metadata explicitly.
+        self.forward_metadata = prefill_metadata
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        """Initialize metadata shared by all attention layers in this forward."""
+        if forward_batch.composition is not None:
+            self._init_forward_composition_metadata(forward_batch)
+            return
+        self.forward_composition_metadata = None
+        self.forward_metadata = self._build_forward_metadata(forward_batch)
+
+    def _build_forward_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> FlashAttentionMetadata:
+        """Build one homogeneous FA metadata plan.
+
+        The helper still publishes ``self.forward_metadata`` for compatibility
+        with existing callers; composition stores both returned objects and
+        supplies the active one explicitly to ``forward_extend``.
+        """
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
@@ -1156,6 +1246,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
         self.forward_metadata = metadata
+        return metadata
 
     def forward_extend(
         self,
@@ -1176,7 +1267,39 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
+        forward_metadata: Optional[FlashAttentionMetadata] = None,
+        forward_metadata_spec_decode_expand: Optional[
+            FlashAttentionMetadata
+        ] = None,
     ):
+        if forward_batch.composition is not None:
+            return self._forward_extend_composition(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                sinks=sinks,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                score_mod=score_mod,
+                aux_tensors=aux_tensors,
+                rel_bias=rel_bias,
+                rel_bias_event=rel_bias_event,
+            )
+
+        active_metadata = (
+            forward_metadata if forward_metadata is not None else self.forward_metadata
+        )
+        active_expand_metadata = (
+            forward_metadata_spec_decode_expand
+            if forward_metadata_spec_decode_expand is not None
+            else self.forward_metadata_spec_decode_expand
+        )
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         is_cp_mode = (
@@ -1217,7 +1340,7 @@ class FlashAttentionBackend(AttentionBackend):
                     # Dense-MHA CP: k, v are still rank-local; backend
                     # all-gathers and writes to the per-rank pool.
                     swa_loc = (
-                        self.forward_metadata.swa_out_cache_loc
+                        active_metadata.swa_out_cache_loc
                         if self.use_sliding_window_kv_pool
                         else None
                     )
@@ -1241,7 +1364,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc(cache_loc, active_metadata.swa_out_cache_loc),
                         k,
                         v,
                         k_scale,
@@ -1249,7 +1372,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
 
         # Use precomputed metadata across all layers
-        metadata = self.forward_metadata
+        metadata = active_metadata
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
@@ -1519,11 +1642,11 @@ class FlashAttentionBackend(AttentionBackend):
                     v_cache=value_cache.view(
                         -1, 1, layer.tp_v_head_num, layer.head_dim
                     ),
-                    page_table=self.forward_metadata_spec_decode_expand.page_table,
-                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                    page_table=active_expand_metadata.page_table,
+                    cache_seqlens=active_expand_metadata.cache_seqlens_int32,
+                    cu_seqlens_q=active_expand_metadata.cu_seqlens_q,
+                    cu_seqlens_k_new=active_expand_metadata.cu_seqlens_k,
+                    max_seqlen_q=active_expand_metadata.max_seq_len_q,
                     softmax_scale=layer.scaling,
                     causal=False,
                     window_size=window_size,
@@ -1720,11 +1843,11 @@ class FlashAttentionBackend(AttentionBackend):
                                 k_cache=k_rope_cache,
                                 v_cache=c_kv_cache,
                                 qv=q_nope,
-                                page_table=self.forward_metadata_spec_decode_expand.page_table,
-                                cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                                cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                                cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                                max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                                page_table=active_expand_metadata.page_table,
+                                cache_seqlens=active_expand_metadata.cache_seqlens_int32,
+                                cu_seqlens_q=active_expand_metadata.cu_seqlens_q,
+                                cu_seqlens_k_new=active_expand_metadata.cu_seqlens_k,
+                                max_seqlen_q=active_expand_metadata.max_seq_len_q,
                                 softmax_scale=layer.scaling,
                                 causal=False,
                                 window_size=window_size,
@@ -1745,7 +1868,126 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        maybe_record_attention(layer.layer_id, o)
+        return o
+
+    def _forward_extend_composition(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
+        q_descale: Optional[torch.Tensor] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
+        score_mod=None,
+        aux_tensors=None,
+        rel_bias=None,
+        rel_bias_event=None,
+    ) -> torch.Tensor:
+        """Execute a packed prefill/verify as two native FA3 extend calls.
+
+        Q/K/V and the output remain views of their packed storage.  Splitting at
+        the attention boundary is required because FA3 accepts one page-table /
+        query-layout plan per invocation, while prefill and tree verify use
+        different causal geometries.
+        """
+        composition = forward_batch.composition
+        metadata = self.forward_composition_metadata
+        if composition is None or metadata is None:
+            raise RuntimeError("FA3 composition metadata was not initialized")
+        composition.validate(q.shape[0])
+        if (
+            score_mod is not None
+            or aux_tensors is not None
+            or rel_bias is not None
+            or rel_bias_event is not None
+        ):
+            raise NotImplementedError(
+                "FA3 forward composition does not support score_mod, auxiliary "
+                "tensors, or relative bias"
+            )
+
+        prefill_end = metadata.prefill_num_tokens
+        total_tokens = q.shape[0]
+        attn_out = getattr(forward_batch, "_attn_output", None)
+        if attn_out is None:
+            attn_out = q.new_empty(
+                (total_tokens, layer.tp_q_head_num * layer.v_head_dim)
+            )
+
+        def token_view(tensor, start, end):
+            if tensor is None:
+                return None
+            # Q/K/V/RoPE are token-major. Scale tensors may instead be scalar
+            # or cache-global; only split them when they carry the packed token
+            # dimension.
+            if tensor.ndim > 0 and tensor.shape[0] == total_tokens:
+                return tensor[start:end]
+            return tensor
+
+        missing = object()
+        prefill_previous_out = getattr(
+            composition.prefill_batch, "_attn_output", missing
+        )
+        verify_previous_out = getattr(
+            composition.verify_batch, "_attn_output", missing
+        )
+        composition.prefill_batch._attn_output = attn_out[:prefill_end]
+        composition.verify_batch._attn_output = attn_out[prefill_end:]
+
+        try:
+            prefill_out = self.forward_extend(
+                q[:prefill_end],
+                token_view(k, 0, prefill_end),
+                token_view(v, 0, prefill_end),
+                layer,
+                composition.prefill_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=token_view(q_rope, 0, prefill_end),
+                k_rope=token_view(k_rope, 0, prefill_end),
+                sinks=sinks,
+                q_descale=token_view(q_descale, 0, prefill_end),
+                k_descale=token_view(k_descale, 0, prefill_end),
+                v_descale=token_view(v_descale, 0, prefill_end),
+                forward_metadata=metadata.prefill,
+            )
+            verify_out = self.forward_extend(
+                q[prefill_end:],
+                token_view(k, prefill_end, None),
+                token_view(v, prefill_end, None),
+                layer,
+                composition.verify_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=token_view(q_rope, prefill_end, None),
+                k_rope=token_view(k_rope, prefill_end, None),
+                sinks=sinks,
+                q_descale=token_view(q_descale, prefill_end, None),
+                k_descale=token_view(k_descale, prefill_end, None),
+                v_descale=token_view(v_descale, prefill_end, None),
+                forward_metadata=metadata.verify,
+            )
+        finally:
+            if prefill_previous_out is missing:
+                del composition.prefill_batch._attn_output
+            else:
+                composition.prefill_batch._attn_output = prefill_previous_out
+            if verify_previous_out is missing:
+                del composition.verify_batch._attn_output
+            else:
+                composition.verify_batch._attn_output = verify_previous_out
+
+        if prefill_out.data_ptr() != attn_out[:prefill_end].data_ptr():
+            raise RuntimeError("FA3 prefill composition did not use its output view")
+        if verify_out.data_ptr() != attn_out[prefill_end:].data_ptr():
+            raise RuntimeError("FA3 verify composition did not use its output view")
+        return attn_out
 
     def forward_decode(
         self,

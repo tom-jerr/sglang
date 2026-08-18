@@ -11,12 +11,16 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.eagle_worker_v2 import (
+    EagleDraftWorker,
+    EAGLEWorkerV2,
+    _supports_fa3_draft_extend_cuda_graph,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -127,6 +131,25 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 self.assertEqual(fast_index.dtype, torch.long)
                 self.assertTrue(fast_parent.is_contiguous())
                 self.assertTrue(fast_index.is_contiguous())
+
+    def test_fa3_draft_extend_cuda_graph_capability_gate(self):
+        backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        backend.fa_impl_ver = 3
+        backend.use_sliding_window_kv_pool = False
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2._is_cuda", True
+        ):
+            self.assertTrue(_supports_fa3_draft_extend_cuda_graph(backend))
+
+            backend.fa_impl_ver = 4
+            self.assertFalse(_supports_fa3_draft_extend_cuda_graph(backend))
+
+        backend.fa_impl_ver = 3
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2._is_cuda", False
+        ):
+            self.assertFalse(_supports_fa3_draft_extend_cuda_graph(backend))
 
     def test_assert_on_inconsistent_steps_and_draft_tokens(self):
         # num_draft_tokens must equal num_steps + 1 for topk=1.

@@ -2030,6 +2030,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
+    # Source views for an experimental speculative mixed iteration. They keep
+    # prefill staging and running draft state separate until the worker packs
+    # the target forward.
+    spec_mixed_prefill_batch: Optional["ScheduleBatch"] = None
+    spec_mixed_verify_batch: Optional["ScheduleBatch"] = None
 
     # For split prefill
     split_index: int = 0
@@ -2769,6 +2774,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.is_prefill_only = False
 
+    def mix_with_spec_running(self, running_batch: "ScheduleBatch"):
+        """Transfer prefill and speculative-running ownership without flattening state."""
+        if self.spec_algorithm.is_none():
+            raise ValueError("Speculative mixed batching requires a spec algorithm")
+        if self.return_logprob or running_batch.return_logprob:
+            raise ValueError("Speculative mixed batching does not support logprobs")
+        self.spec_mixed_prefill_batch = copy.copy(self)
+        self.spec_mixed_prefill_batch.reqs = self.reqs[:]
+        # A batch that was the parent of an earlier mixed iteration can become
+        # the running input of the next one.  Child snapshots must always be
+        # leaves; otherwise overlap input resolution recursively follows stale
+        # child pointers from the previous iteration.
+        self.spec_mixed_prefill_batch.spec_mixed_prefill_batch = None
+        self.spec_mixed_prefill_batch.spec_mixed_verify_batch = None
+        self.spec_mixed_verify_batch = copy.copy(running_batch)
+        self.spec_mixed_verify_batch.reqs = running_batch.reqs[:]
+        self.spec_mixed_verify_batch.spec_mixed_prefill_batch = None
+        self.spec_mixed_verify_batch.spec_mixed_verify_batch = None
+        self.forward_mode = ForwardMode.MIXED
+        self.input_ids = None
+        self.merge_batch(running_batch)
+        self.out_cache_loc = None
+        self.decoding_reqs = self.spec_mixed_verify_batch.reqs
+        self.is_prefill_only = False
+
     def new_tokens_required_next_decode(
         self, selected_indices: Optional[List[int]] = None
     ):
@@ -2790,6 +2820,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reserve = get_alloc_reserve_per_decode()
         total = 0
         for r in requests:
+            if r.kv is None:
+                # Under overlap scheduling a just-prefilled request can enter
+                # the next planning pass before process_batch_result_prefill
+                # publishes its ReqKvInfo.  Its exact allocation is therefore
+                # unavailable.  Reserve one complete, page-aligned speculative
+                # decode window; once the result is published the normal exact
+                # allocated-vs-committed calculation below takes over.
+                total += ceil_align(reserve, page_size)
+                continue
             x = max(0, r.kv_committed_len + reserve - r.kv.kv_allocated_len)
             cur = r.kv.kv_allocated_len
             nxt = cur + x
@@ -3277,6 +3316,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=self.return_hidden_states,
             return_hidden_states_mode=self.return_hidden_states_mode,
             decoding_reqs=self.decoding_reqs,
+            spec_mixed_prefill_batch=self.spec_mixed_prefill_batch,
+            spec_mixed_verify_batch=self.spec_mixed_verify_batch,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,

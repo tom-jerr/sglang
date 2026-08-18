@@ -97,6 +97,12 @@ class GenerationBatchResult:
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
     extra_keep_alive_refs: Optional[List[Any]] = None
 
+    # Internal sidecars for a speculative mixed iteration. External request
+    # ordering remains on the parent ScheduleBatch; result processors consume
+    # each sidecar with its corresponding source view.
+    spec_mixed_prefill_result: Optional["GenerationBatchResult"] = None
+    spec_mixed_verify_result: Optional["GenerationBatchResult"] = None
+
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
@@ -120,6 +126,22 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        if self.spec_mixed_prefill_result is not None:
+            if self.spec_mixed_verify_result is None:
+                raise ValueError(
+                    "Speculative mixed result is missing its verify sidecar"
+                )
+            for result in (
+                self.spec_mixed_prefill_result,
+                self.spec_mixed_verify_result,
+            ):
+                result.copy_done = self.copy_done
+                result.copy_to_cpu(
+                    return_logprob=return_logprob,
+                    return_hidden_states=return_hidden_states,
+                )
+            return
+
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
@@ -373,7 +395,7 @@ def msgpack_decode_explained(data: bytes) -> Any:
             if m is not None:
                 idx = int(m.group(1))
                 if 1 <= idx <= len(fields):
-                    msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
+                    msg = f"{msg[: m.start()]}$.{fields[idx - 1]}{msg[m.end() :]}"
         raise MsgpackDecodeError(rid, msg) from e
 
 

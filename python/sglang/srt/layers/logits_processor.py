@@ -145,6 +145,45 @@ class LogitsProcessorOutput:
     mm_input_embeds: Optional[torch.Tensor] = None
 
 
+def split_composition_logits_output(
+    packed: LogitsProcessorOutput,
+    *,
+    prefill_requests: int,
+    prefill_tokens: int,
+    verify_tokens: int,
+) -> tuple[LogitsProcessorOutput, LogitsProcessorOutput]:
+    """Return segment views without copying packed logits or hidden states."""
+    logits = packed.next_token_logits
+    if logits is None or logits.shape[0] != prefill_requests + verify_tokens:
+        raise ValueError("Packed composition logits have an unexpected row count")
+    hidden_states = packed.hidden_states
+    if (
+        hidden_states is not None
+        and hidden_states.shape[0] != prefill_tokens + verify_tokens
+    ):
+        raise ValueError(
+            "Packed composition hidden states have an unexpected row count"
+        )
+    prefill_hidden = (
+        hidden_states[:prefill_tokens] if hidden_states is not None else None
+    )
+    verify_hidden = (
+        hidden_states[prefill_tokens:] if hidden_states is not None else None
+    )
+    return (
+        dataclasses.replace(
+            packed,
+            next_token_logits=logits[:prefill_requests],
+            hidden_states=prefill_hidden,
+        ),
+        dataclasses.replace(
+            packed,
+            next_token_logits=logits[prefill_requests:],
+            hidden_states=verify_hidden,
+        ),
+    )
+
+
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode
@@ -188,6 +227,10 @@ class LogitsMetadata:
     # EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
+    # Heterogeneous prefill+verify: prefill contributes one last-token row per
+    # request while verify contributes every candidate row.
+    composition_gather_indices: Optional[torch.Tensor] = None
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -220,6 +263,12 @@ class LogitsMetadata:
         else:
             draft_extend_select_index = None
 
+        composition_gather_indices = (
+            forward_batch.composition.build_logits_gather_indices()
+            if forward_batch.composition is not None
+            else None
+        )
+
         return cls(
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
@@ -244,6 +293,7 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            composition_gather_indices=composition_gather_indices,
         )
 
     def compute_dp_attention_metadata(self):
@@ -435,7 +485,20 @@ class LogitsProcessor(nn.Module):
         aux_pruned_states = None
         token_to_seq_idx = []
 
-        if (
+        if logits_metadata.composition_gather_indices is not None:
+            gather_indices = logits_metadata.composition_gather_indices
+            pruned_states = hidden_states[gather_indices]
+            if hidden_states_before_norm is not None:
+                pruned_states_before_norm = hidden_states_before_norm[gather_indices]
+            if aux_hidden_states is not None:
+                aux_pruned_states = (
+                    aux_hidden_states[gather_indices]
+                    if isinstance(aux_hidden_states, torch.Tensor)
+                    else [hidden[gather_indices] for hidden in aux_hidden_states]
+                )
+            sample_indices = None
+            input_logprob_indices = None
+        elif (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()

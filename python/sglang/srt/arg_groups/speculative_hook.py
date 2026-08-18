@@ -533,6 +533,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         resolved_view,
     )
 
+    model_config = server_args.get_model_config()
+
     if (
         server_args.speculative_algorithm == "STANDALONE"
         and resolved_view(server_args).enable_dp_attention
@@ -557,13 +559,38 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
     if server_args.enable_mixed_chunk:
-        server_args.enable_mixed_chunk = False
-        logger.warning(
-            "Mixed chunked prefill is disabled because of using "
-            "eagle speculative decoding."
+        view = resolved_view(server_args)
+        mixed_supported = (
+            server_args.speculative_algorithm in ("EAGLE", "EAGLE3")
+            and server_args.speculative_eagle_topk == 1
+            and view.attention_backend in ("triton", "fa3")
+            and server_args.tp_size == 1
+            and server_args.pp_size == 1
+            and server_args.dp_size == 1
+            and not server_args.enable_multi_layer_eagle
+            and not (
+                bool(server_args.enable_lora) or bool(server_args.lora_paths)
+            )
+            and not model_config.is_multimodal
+            and not model_config.is_encoder_decoder
         )
+        if not mixed_supported:
+            server_args.enable_mixed_chunk = False
+            logger.warning(
+                "Mixed chunked prefill is disabled for this EAGLE configuration; "
+                "the experimental path requires EAGLE/EAGLE3, topk=1, Triton/FA3 target "
+                "attention, single-layer/single-GPU execution, and currently "
+                "does not support LoRA, multimodal, or encoder-decoder models."
+            )
+        else:
+            logger.warning(
+                "Experimental EAGLE mixed chunk is enabled for the %s backend; mixed iterations "
+                "use Breakable prefill CUDA graphs when configured and fall back to "
+                "eager execution otherwise.",
+                view.attention_backend,
+            )
 
-    model_arch = server_args.get_model_config().hf_config.architectures[0]
+    model_arch = model_config.hf_config.architectures[0]
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",

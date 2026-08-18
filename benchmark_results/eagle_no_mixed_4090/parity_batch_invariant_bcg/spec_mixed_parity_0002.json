@@ -1,0 +1,1253 @@
+{
+  "attention": {
+    "0": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "1": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "10": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "11": {
+      "cosine_error": 5.960464477539063e-08,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "12": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "13": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "14": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "15": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "16": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "17": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "18": {
+      "cosine_error": -1.1920928955078125e-07,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "19": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "2": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "20": {
+      "cosine_error": 5.960464477539063e-08,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "21": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "22": {
+      "cosine_error": 1.7881393432617188e-07,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "23": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "24": {
+      "cosine_error": -1.1920928955078125e-07,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "25": {
+      "cosine_error": 1.1920928955078125e-07,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "26": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "27": {
+      "cosine_error": -1.1920928955078125e-07,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "28": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "29": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "3": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "30": {
+      "cosine_error": 1.1920928955078125e-07,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "31": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "32": {
+      "cosine_error": -1.1920928955078125e-07,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "33": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "34": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "35": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "4": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "5": {
+      "cosine_error": -1.1920928955078125e-07,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "6": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "7": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "8": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    },
+    "9": {
+      "cosine_error": 1.1920928955078125e-07,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        512,
+        4096
+      ]
+    }
+  },
+  "candidate_used_cuda_graph": true,
+  "device": "NVIDIA GeForce RTX 4090",
+  "dtype": "torch.bfloat16",
+  "kv": {
+    "0": {
+      "key": {
+        "cosine_error": 5.960464477539063e-08,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "1": {
+      "key": {
+        "cosine_error": 5.960464477539063e-08,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "10": {
+      "key": {
+        "cosine_error": 1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "11": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "12": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "13": {
+      "key": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "14": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "15": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "16": {
+      "key": {
+        "cosine_error": 1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "17": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "18": {
+      "key": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "19": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "2": {
+      "key": {
+        "cosine_error": 5.960464477539063e-08,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "20": {
+      "key": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "21": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 5.960464477539063e-08,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "22": {
+      "key": {
+        "cosine_error": 1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "23": {
+      "key": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "24": {
+      "key": {
+        "cosine_error": 5.960464477539063e-08,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "25": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "26": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "27": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "28": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "29": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 5.960464477539063e-08,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "3": {
+      "key": {
+        "cosine_error": 5.960464477539063e-08,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "30": {
+      "key": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "31": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "32": {
+      "key": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "33": {
+      "key": {
+        "cosine_error": 5.960464477539063e-08,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "34": {
+      "key": {
+        "cosine_error": 1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "35": {
+      "key": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "4": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "5": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "6": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "7": {
+      "key": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "8": {
+      "key": {
+        "cosine_error": -1.1920928955078125e-07,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    },
+    "9": {
+      "key": {
+        "cosine_error": 5.960464477539063e-08,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      },
+      "value": {
+        "cosine_error": 0.0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0,
+        "shape": [
+          512,
+          8,
+          128
+        ]
+      }
+    }
+  },
+  "logits": {
+    "first_divergent_row": null,
+    "minimum_reference_top2_margin": 1.5,
+    "num_argmax_divergences": 0,
+    "num_rows": 6,
+    "tensor_error": {
+      "cosine_error": 0.0,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "shape": [
+        6,
+        151936
+      ]
+    }
+  },
+  "prefill_requests": 2,
+  "prefill_tokens": 508,
+  "verify_requests": 1,
+  "verify_tokens": 4
+}

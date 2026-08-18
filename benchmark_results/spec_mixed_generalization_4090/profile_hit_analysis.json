@@ -1,0 +1,334 @@
+{
+  "trace": "benchmark_results/spec_mixed_generalization_4090/profiler_hit_final/prefix-hit-1786892157.2791393-TP-0.trace.json.gz",
+  "event_count": 271009,
+  "steps": {
+    "EXTEND": {
+      "duration": {
+        "count": 7,
+        "mean_ms": 4.5274337142857135,
+        "p50_ms": 1.9548800000000002,
+        "p90_ms": 20.097687999999998,
+        "p99_ms": 20.097687999999998,
+        "min_ms": 1.7573489999999998,
+        "max_ms": 20.097687999999998
+      },
+      "batch_sizes": {
+        "1": 2,
+        "2": 2,
+        "3": 1,
+        "4": 2
+      }
+    },
+    "MIXED": {
+      "duration": {
+        "count": 5,
+        "mean_ms": 31.9930778,
+        "p50_ms": 31.995789000000002,
+        "p90_ms": 33.072195,
+        "p99_ms": 33.072195,
+        "min_ms": 30.762337,
+        "max_ms": 33.072195
+      },
+      "batch_sizes": {
+        "4": 1,
+        "6": 1,
+        "10": 1,
+        "12": 1,
+        "16": 1
+      }
+    },
+    "TARGET_VERIFY": {
+      "duration": {
+        "count": 56,
+        "mean_ms": 1.5801194107142857,
+        "p50_ms": 1.393759,
+        "p90_ms": 2.220301,
+        "p99_ms": 3.6162379999999996,
+        "min_ms": 1.28041,
+        "max_ms": 3.6162379999999996
+      },
+      "batch_sizes": {
+        "1": 2,
+        "2": 3,
+        "3": 1,
+        "4": 45,
+        "5": 1,
+        "9": 1,
+        "11": 1,
+        "16": 2
+      }
+    }
+  },
+  "mixed": {
+    "cpu_duration": {
+      "count": 5,
+      "mean_ms": 31.9930778,
+      "p50_ms": 31.995789000000002,
+      "p90_ms": 33.072195,
+      "p99_ms": 33.072195,
+      "min_ms": 30.762337,
+      "max_ms": 33.072195
+    },
+    "gpu_duration": {
+      "count": 5,
+      "mean_ms": 71.9986348,
+      "p50_ms": 71.904765,
+      "p90_ms": 84.406693,
+      "p99_ms": 84.406693,
+      "min_ms": 59.948377,
+      "max_ms": 84.406693
+    },
+    "pre_model_cpu": {
+      "count": 5,
+      "mean_ms": 1.43131064453125,
+      "p50_ms": 1.4358330078125,
+      "p90_ms": 1.50387109375,
+      "p99_ms": 1.50387109375,
+      "min_ms": 1.37697216796875,
+      "max_ms": 1.50387109375
+    },
+    "pre_attention_cpu": {
+      "count": 5,
+      "mean_ms": 1.43131064453125,
+      "p50_ms": 1.4358330078125,
+      "p90_ms": 1.50387109375,
+      "p99_ms": 1.50387109375,
+      "min_ms": 1.37697216796875,
+      "max_ms": 1.50387109375
+    },
+    "gpu_tail_after_cpu_submission": {
+      "count": 5,
+      "mean_ms": 40.12874404296875,
+      "p50_ms": 40.13821923828125,
+      "p90_ms": 53.76031640625,
+      "p99_ms": 53.76031640625,
+      "min_ms": 27.81466259765625,
+      "max_ms": 53.76031640625
+    },
+    "cpu_submission_hidden_count": 5,
+    "cpu_submission_pair_count": 5,
+    "forbidden_sync_counts": {},
+    "pre_model_pack_operator_counts": {
+      "aten::_foreach_copy_": 5,
+      "aten::cumsum": 20,
+      "aten::arange": 5
+    },
+    "whole_step_pack_operator_counts": {
+      "aten::_foreach_copy_": 5,
+      "aten::cumsum": 20,
+      "aten::arange": 5,
+      "aten::cat": 5
+    },
+    "launched_memcpy_counts": {
+      "Memcpy DtoD (Device -> Device)": 20
+    },
+    "launched_memcpy_bytes": {
+      "Memcpy DtoD (Device -> Device)": 1152
+    },
+    "cuda_launch_count": 1405,
+    "top_cpu_ops_inclusive_us": [
+      {
+        "name": "sglang::unified_attention_with_output",
+        "count": 180,
+        "duration_us": 130260.70899999993
+      },
+      {
+        "name": "aten::contiguous",
+        "count": 720,
+        "duration_us": 22149.575999999994
+      },
+      {
+        "name": "aten::clone",
+        "count": 720,
+        "duration_us": 20865.056999999986
+      },
+      {
+        "name": "aten::slice",
+        "count": 3220,
+        "duration_us": 14278.524999999994
+      },
+      {
+        "name": "aten::copy_",
+        "count": 785,
+        "duration_us": 11844.194000000009
+      },
+      {
+        "name": "sglang::store_cache",
+        "count": 360,
+        "duration_us": 10669.161999999998
+      },
+      {
+        "name": "aten::empty_like",
+        "count": 720,
+        "duration_us": 6760.627000000003
+      },
+      {
+        "name": "aten::empty",
+        "count": 725,
+        "duration_us": 5131.915000000003
+      },
+      {
+        "name": "aten::view",
+        "count": 2360,
+        "duration_us": 4700.486000000002
+      },
+      {
+        "name": "aten::zero_",
+        "count": 195,
+        "duration_us": 4109.141000000001
+      },
+      {
+        "name": "aten::fill_",
+        "count": 195,
+        "duration_us": 3108.4529999999995
+      },
+      {
+        "name": "aten::as_strided",
+        "count": 3275,
+        "duration_us": 2538.2010000000046
+      },
+      {
+        "name": "aten::to",
+        "count": 30,
+        "duration_us": 1112.6080000000002
+      },
+      {
+        "name": "aten::cumsum",
+        "count": 20,
+        "duration_us": 1096.363
+      },
+      {
+        "name": "aten::_to_copy",
+        "count": 15,
+        "duration_us": 1070.916
+      },
+      {
+        "name": "aten::matmul",
+        "count": 5,
+        "duration_us": 715.818
+      },
+      {
+        "name": "aten::empty_strided",
+        "count": 15,
+        "duration_us": 706.109
+      },
+      {
+        "name": "aten::mm",
+        "count": 5,
+        "duration_us": 695.4200000000001
+      },
+      {
+        "name": "aten::index",
+        "count": 20,
+        "duration_us": 662.1039999999998
+      },
+      {
+        "name": "aten::cat",
+        "count": 5,
+        "duration_us": 548.8340000000001
+      }
+    ],
+    "top_gpu_kernel_groups_us": [
+      {
+        "name": "triton_attention::_fwd_kernel",
+        "count": 360,
+        "duration_us": 217571.98200000002
+      },
+      {
+        "name": "matmul",
+        "count": 725,
+        "duration_us": 123347.37899999993
+      },
+      {
+        "name": "copy_kernel",
+        "count": 2215,
+        "duration_us": 3649.5200000000027
+      },
+      {
+        "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl<at::native::BinaryFunctor<float, float, float, a",
+        "count": 360,
+        "duration_us": 1033.8099999999995
+      },
+      {
+        "name": "mean_kernel",
+        "count": 360,
+        "duration_us": 579.7510000000003
+      },
+      {
+        "name": "store_kvcache",
+        "count": 360,
+        "duration_us": 529.5069999999988
+      },
+      {
+        "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, f",
+        "count": 360,
+        "duration_us": 506.6329999999997
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul> >(int, at::",
+        "count": 360,
+        "duration_us": 403.8390000000006
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<float",
+        "count": 360,
+        "duration_us": 365.86099999999976
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::",
+        "count": 360,
+        "duration_us": 340.4169999999992
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, std::array<char*, 2ul> >(int",
+        "count": 360,
+        "duration_us": 316.7339999999994
+      },
+      {
+        "name": "activation",
+        "count": 180,
+        "duration_us": 277.91899999999976
+      },
+      {
+        "name": "rope",
+        "count": 180,
+        "duration_us": 266.4960000000001
+      },
+      {
+        "name": "void sglang::fused_qknorm_warp<128l, false, __nv_bfloat16>(sglang::QKNormParams)",
+        "count": 180,
+        "duration_us": 254.1749999999999
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<c10::BFloat16>, std::array<char*, 1ul> >(int, ",
+        "count": 180,
+        "duration_us": 152.1909999999999
+      },
+      {
+        "name": "create_flashinfer_kv_indices_triton",
+        "count": 10,
+        "duration_us": 62.976000000000006
+      },
+      {
+        "name": "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, long, long, bool)",
+        "count": 25,
+        "duration_us": 32.96100000000001
+      },
+      {
+        "name": "void at_cuda_detail::cub::detail::scan::DeviceScanKernel<at_cuda_detail::cub::detail::scan::policy_hub<long, long, long,",
+        "count": 20,
+        "duration_us": 25.633000000000006
+      },
+      {
+        "name": "memcpy32_post",
+        "count": 20,
+        "duration_us": 24.001
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(i",
+        "count": 15,
+        "duration_us": 19.745
+      }
+    ]
+  }
+}

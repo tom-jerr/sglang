@@ -1,0 +1,13 @@
+{
+  "kind": "miss",
+  "num_steps": 120,
+  "request_count": 12,
+  "profile_response": {
+    "start_response": "Start profiling.\n",
+    "stop_status": 200,
+    "stop_response": "Stop profiling. This will take some time.\n"
+  },
+  "traces": [
+    "benchmark_results/spec_mixed_generalization_4090/profiler_separated_miss_final/prefix-miss-1786894245.776333-TP-0.trace.json.gz"
+  ]
+}

@@ -1173,6 +1173,8 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        self._spec_mixed_decode_service_ewma_s: Optional[float] = None
+        self._spec_mixed_last_decode_completion_s = 0.0
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -1187,6 +1189,53 @@ class Scheduler(
                     "Dynamic chunking will be disabled."
                 )
                 self.enable_dynamic_chunking = False
+
+    def _should_mix_spec_prefill(
+        self, new_batch: ScheduleBatch, running_batch: ScheduleBatch
+    ) -> bool:
+        """Admit tiny cache-hit suffixes as pure prefill while decode has slack."""
+        extend_lens = [req.extend_range.length for req in new_batch.reqs]
+        if not extend_lens:
+            return True
+        cache_hit = all(
+            len(getattr(req, "prefix_indices", ())) > 0 for req in new_batch.reqs
+        )
+        if not cache_hit:
+            return True
+        total_extend = sum(extend_lens)
+        tiny_suffix = max(extend_lens) <= 4 and total_extend <= max(
+            8, 2 * len(new_batch.reqs)
+        )
+        if not tiny_suffix:
+            return True
+
+        # Until a service sample exists, favor completing the tiny prefix hit;
+        # the next scheduling pass still retains the running batch.
+        service = self._spec_mixed_decode_service_ewma_s
+        completed = self._spec_mixed_last_decode_completion_s
+        if service is None or completed <= 0:
+            return False
+
+        decode_slo = max(0.020, 2.0 * service)
+        deadline = completed + decode_slo
+        verify_tokens = max(
+            1,
+            len(running_batch.reqs) * get_spec().speculative_num_draft_tokens,
+        )
+        relative_work = min(1.0, total_extend / verify_tokens)
+        predicted_prefill = max(0.0005, service * max(0.10, 0.25 * relative_work))
+        return time.monotonic() + predicted_prefill >= deadline
+
+    def _record_spec_decode_service(self, batch: ScheduleBatch) -> None:
+        if not batch.launch_ts:
+            return
+        now = time.monotonic()
+        sample = max(0.0, now - batch.launch_ts)
+        previous = self._spec_mixed_decode_service_ewma_s
+        self._spec_mixed_decode_service_ewma_s = (
+            sample if previous is None else 0.2 * sample + 0.8 * previous
+        )
+        self._spec_mixed_last_decode_completion_s = now
 
     def init_metrics_reporter(
         self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
@@ -1457,6 +1506,7 @@ class Scheduler(
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
             needs_confidence_relay=needs_confidence_relay,
+            relay_tickets_enabled=self.is_mixed_chunk,
         )
 
         self._confidence_budget_prepare = None
@@ -1796,7 +1846,16 @@ class Scheduler(
                 batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
-                self.result_queue.append((batch.copy(), batch_result))
+                result_batch = batch.copy()
+                self.result_queue.append((result_batch, batch_result))
+                if batch.spec_mixed_prefill_batch is not None:
+                    # The result snapshot owns the role-specific children until
+                    # asynchronous result processing consumes its two sidecars.
+                    # The live batch is reused by get_next_batch_to_run and must
+                    # not carry this one-forward composition into the next
+                    # decode iteration.
+                    batch.spec_mixed_prefill_batch = None
+                    batch.spec_mixed_verify_batch = None
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -2120,13 +2179,23 @@ class Scheduler(
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
-            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
+            get_total_prefill_uncached_tokens=lambda: (
+                self.total_prefill_uncached_tokens
+            ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
@@ -3250,6 +3319,18 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        is_spec_mixed = self.is_mixed_chunk and not self.spec_algorithm.is_none()
+        mixed_compute_tokens = (
+            running_bs * get_spec().speculative_num_draft_tokens
+            if is_spec_mixed
+            else running_bs if self.is_mixed_chunk else 0
+        )
+        mixed_kv_reserve_tokens = (
+            running_batch.new_tokens_required_next_decode()
+            if self.is_mixed_chunk and running_bs > 0
+            else 0
+        )
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -3258,8 +3339,9 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            mixed_compute_tokens,
             self.priority_scheduling_preemption_threshold,
+            mixed_kv_reserve_tokens=mixed_kv_reserve_tokens,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
             prefill_max_requests=get_schedule().prefill_max_requests,
@@ -3434,14 +3516,25 @@ class Scheduler(
             and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            running_batch.filter_batch()
-            if not running_batch.is_empty():
-                running_batch.prepare_for_decode()
-                new_batch.mix_with_running(running_batch)
-                new_batch.decoding_reqs = running_batch.reqs
-            running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=running_batch.batch_is_full
+            should_mix = not is_spec_mixed or self._should_mix_spec_prefill(
+                new_batch, running_batch
             )
+            if should_mix:
+                running_batch.filter_batch()
+                if not running_batch.is_empty():
+                    running_batch.prepare_for_decode()
+                    if is_spec_mixed:
+                        new_batch.mix_with_spec_running(running_batch)
+                    else:
+                        new_batch.mix_with_running(running_batch)
+                    new_batch.decoding_reqs = running_batch.reqs
+                running_batch = ScheduleBatch(
+                    reqs=[], batch_is_full=running_batch.batch_is_full
+                )
+            else:
+                # Prefix-cache tiny suffix: finish the inexpensive pure prefill
+                # and keep decode ownership for the next scheduling pass.
+                new_batch.decoding_reqs = None
         else:
             new_batch.decoding_reqs = None
 
@@ -3675,9 +3768,30 @@ class Scheduler(
                         # Non-spec has no later work — scheduler publishes after return.
                         fwd_kwargs = {}
                         if not batch.spec_algorithm.is_none():
-                            fwd_kwargs["on_publish"] = partial(
-                                self.future_map.publish, future_indices
-                            )
+                            if (
+                                self.spec_algorithm.is_eagle()
+                                and self.future_map.relay_tickets_enabled
+                            ):
+                                relay_rows = batch.req_pool_indices_cpu.to(torch.int64)
+                                relay_generations = (
+                                    self.req_to_token_pool.req_generation[
+                                        relay_rows
+                                    ].clone()
+                                )
+                                relay_producer_forwards = torch.full_like(
+                                    relay_rows, batch.forward_iter
+                                )
+                                fwd_kwargs["on_publish"] = partial(
+                                    self.future_map.publish,
+                                    future_indices,
+                                    future_indices_cpu=relay_rows,
+                                    generations=relay_generations,
+                                    producer_forwards=relay_producer_forwards,
+                                )
+                            else:
+                                fwd_kwargs["on_publish"] = partial(
+                                    self.future_map.publish, future_indices
+                                )
                             # Grammar-overlap-capable workers advance the grammar FSM
                             # inside verify() before building the bitmask; hand them the
                             # barrier that resolves the previous batch's committed
@@ -3691,6 +3805,26 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if (
+                            batch_result.next_draft_input is not None
+                            and self.future_map.relay_tickets_enabled
+                        ):
+                            self._tag_relay_draft_input(
+                                batch_result.next_draft_input, batch
+                            )
+                            if batch.spec_mixed_prefill_batch is not None:
+                                self._tag_relay_draft_input(
+                                    batch.spec_mixed_prefill_batch.spec_info,
+                                    batch.spec_mixed_prefill_batch,
+                                    producer_forward=batch.forward_iter,
+                                    producer_mode=batch.forward_mode,
+                                )
+                                self._tag_relay_draft_input(
+                                    batch.spec_mixed_verify_batch.spec_info,
+                                    batch.spec_mixed_verify_batch,
+                                    producer_forward=batch.forward_iter,
+                                    producer_mode=batch.forward_mode,
+                                )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -3717,7 +3851,9 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self._relay_forward_payload(future_indices, batch_result)
+                            self._relay_forward_payload(
+                                future_indices, batch_result, batch=batch
+                            )
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
@@ -3863,8 +3999,36 @@ class Scheduler(
             self.ipc_channels.send_to_tokenizer.send_output(pending)
             model_runner._pending_elastic_scale_update = None
 
+    def _tag_relay_draft_input(
+        self,
+        draft_input,
+        batch: ScheduleBatch,
+        *,
+        producer_forward: Optional[int] = None,
+        producer_mode=None,
+    ) -> None:
+        if draft_input is None:
+            return
+        if not self.spec_algorithm.is_eagle():
+            return
+        if not self.future_map.relay_tickets_enabled:
+            return
+        rows = batch.req_pool_indices_cpu.to(torch.int64)
+        draft_input.future_indices_cpu = rows.clone()
+        draft_input.future_generations = self.req_to_token_pool.req_generation[
+            rows
+        ].clone()
+        forward = batch.forward_iter if producer_forward is None else producer_forward
+        draft_input.future_producer_forwards = torch.full_like(rows, forward)
+        mode = batch.forward_mode if producer_mode is None else producer_mode
+        draft_input.future_producer_modes = [str(mode)] * len(rows)
+
     def _relay_forward_payload(
-        self, future_indices: torch.Tensor, batch_result: GenerationBatchResult
+        self,
+        future_indices: torch.Tensor,
+        batch_result: GenerationBatchResult,
+        *,
+        batch: Optional[ScheduleBatch] = None,
     ) -> None:
         """Stash this iter's relay payload for next iter's resolve_forward_inputs.
         ngram is skipped: it relays its draft via batch.spec_info, not the FutureMap."""
@@ -3876,7 +4040,25 @@ class Scheduler(
             payload = RelayPayload(bonus_tokens=batch_result.next_token_ids)
         else:
             return
-        self.future_map.stash(future_indices, payload)
+        draft_input = batch_result.next_draft_input
+        if not self.future_map.relay_tickets_enabled:
+            self.future_map.stash(future_indices, payload)
+            return
+        self.future_map.stash(
+            future_indices,
+            payload,
+            future_indices_cpu=(batch.req_pool_indices_cpu if batch is not None else None),
+            generations=(
+                getattr(draft_input, "future_generations", None)
+                if draft_input is not None
+                else None
+            ),
+            producer_forwards=(
+                getattr(draft_input, "future_producer_forwards", None)
+                if draft_input is not None
+                else None
+            ),
+        )
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
@@ -3924,7 +4106,25 @@ class Scheduler(
         flush_trace_batch(batch.reqs)
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
-        if batch.forward_mode.is_decode():
+        was_spec_mixed = batch.spec_mixed_prefill_batch is not None
+        if was_spec_mixed:
+            if (
+                batch.spec_mixed_verify_batch is None
+                or result.spec_mixed_prefill_result is None
+                or result.spec_mixed_verify_result is None
+            ):
+                raise ValueError("Incomplete speculative mixed batch result")
+            self.batch_result_processor.process_batch_result_prefill(
+                batch.spec_mixed_prefill_batch,
+                result.spec_mixed_prefill_result,
+            )
+            self.batch_result_processor.process_batch_result_decode(
+                batch.spec_mixed_verify_batch,
+                result.spec_mixed_verify_result,
+            )
+            batch.spec_mixed_prefill_batch = None
+            batch.spec_mixed_verify_batch = None
+        elif batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
@@ -3937,6 +4137,11 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        if not batch.spec_algorithm.is_none() and (
+            was_spec_mixed or batch.forward_mode.is_decode()
+        ):
+            self._record_spec_decode_service(batch)
 
         self._record_step_counters(batch, result)
 

@@ -1076,6 +1076,10 @@ class Envs:
     # Deterministic inference and all-reduce
     # ===================================================================
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # Keep dense operators invariant to the packed M dimension used by
+    # speculative mixed prefill+verify.  This is narrower than full
+    # deterministic inference: attention and sampling keep their normal paths.
+    SGLANG_SPEC_MIXED_BATCH_INVARIANT = EnvBool(False)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
     # Set to 1: force enable (even without --enable-deterministic-inference)

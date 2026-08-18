@@ -113,7 +113,7 @@ class TestPrefillAdder(CustomTestCase):
             new_token_ratio=1.0,
             rem_input_tokens=10000,
             rem_chunk_tokens=None,
-            num_mixed_decode_tokens=0,
+            mixed_compute_tokens=0,
             priority_scheduling_preemption_threshold=0,
         )
         defaults.update(kwargs)
@@ -150,6 +150,51 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIn(running_reqs[0], adder.preempt_list)
         self.assertEqual(adder.rem_total_token_offset, 175)  # 50 + 75 + 100 - 50 = 175
         running_batch.release_req.assert_called_once()
+
+    def test_mixed_compute_and_kv_reserve_are_accounted_separately(self):
+        running_batch = self.create_running_batch([])
+        adder = self.create_adder(
+            running_batch,
+            rem_input_tokens=512,
+            rem_chunk_tokens=512,
+            mixed_compute_tokens=32,
+            mixed_kv_reserve_tokens=7,
+        )
+
+        self.assertEqual(adder.rem_input_tokens, 480)
+        self.assertEqual(adder.rem_chunk_tokens, 480)
+        self.assertEqual(adder.rem_total_token_offset, 7)
+        self.assertEqual(adder.cur_rem_token_offset, 7)
+
+    def test_mixed_kv_reserve_defaults_to_legacy_compute_charge(self):
+        running_batch = self.create_running_batch([])
+        adder = self.create_adder(
+            running_batch,
+            rem_input_tokens=512,
+            rem_chunk_tokens=512,
+            mixed_compute_tokens=32,
+        )
+
+        self.assertEqual(adder.rem_input_tokens, 480)
+        self.assertEqual(adder.rem_chunk_tokens, 480)
+        self.assertEqual(adder.rem_total_token_offset, 32)
+        self.assertEqual(adder.cur_rem_token_offset, 32)
+
+    def test_negative_mixed_kv_reserve_is_rejected(self):
+        running_batch = self.create_running_batch([])
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            self.create_adder(
+                running_batch,
+                mixed_kv_reserve_tokens=-1,
+            )
+
+    def test_negative_mixed_compute_charge_is_rejected(self):
+        running_batch = self.create_running_batch([])
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            self.create_adder(
+                running_batch,
+                mixed_compute_tokens=-1,
+            )
 
     def test_preempt_success_low_priority_values_first(self):
         params = [
@@ -390,7 +435,7 @@ class TestPrefillAdder(CustomTestCase):
             running_batch,
             rem_input_tokens=200,
             rem_chunk_tokens=64,
-            num_mixed_decode_tokens=len(decode_reqs),
+            mixed_compute_tokens=len(decode_reqs),
         )
 
         self.assertEqual(adder.rem_input_tokens, 192)  # 200 - 8
@@ -424,7 +469,7 @@ class TestPrefillAdder(CustomTestCase):
             running_batch2,
             rem_input_tokens=200,
             rem_chunk_tokens=64,
-            num_mixed_decode_tokens=len(remaining_decode_reqs),
+            mixed_compute_tokens=len(remaining_decode_reqs),
         )
 
         self.assertEqual(adder2.rem_input_tokens, 195)  # 200 - 5

@@ -5,7 +5,6 @@ from dataclasses import replace
 from typing import List, Optional
 
 import torch
-
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -25,6 +24,7 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
+from sglang.srt.layers.logits_processor import split_composition_logits_output
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -39,7 +39,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardCompositionTensorScratch,
+    pack_prefill_and_verify_forward,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -73,6 +78,7 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
+    eagle_prepare_for_verify,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
@@ -82,6 +88,22 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
+)
+from sglang.srt.speculative.parity import (
+    AttentionTrace,
+    KVRows,
+    OperatorTrace,
+    attention_parity,
+    install_operator_trace_hooks,
+    logits_parity,
+    operator_parity,
+    operator_parity_enabled,
+    parity_max_steps,
+    parity_output_dir,
+    record_attention,
+    record_operators,
+    remove_operator_trace_hooks,
+    write_parity_report,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -125,6 +147,28 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
+def _supports_fa3_draft_extend_cuda_graph(attn_backend) -> bool:
+    """Whether ``attn_backend`` can capture EAGLE draft-extend with FA3.
+
+    ``FlashAttentionBackend`` already owns the static CUDA-graph buffers and
+    capturable draft-extend metadata update. Keep the platform/version gate
+    here so FA4 and non-CUDA implementations are not enabled implicitly, and
+    reject SWA pool variants whose metadata still needs an eager rebuild.
+    """
+    if not _is_cuda:
+        return False
+
+    from sglang.srt.layers.attention.flashattention_backend import (
+        FlashAttentionBackend,
+    )
+
+    return (
+        isinstance(attn_backend, FlashAttentionBackend)
+        and attn_backend.fa_impl_ver == 3
+        and attn_backend.draft_extend_metadata_captured_in_graph()
+    )
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -162,8 +206,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
+            ctx,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            draft_model_build_scope(),
+        ):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -447,6 +494,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         supports_cuda_draft_extend_graph = (
             _is_cuda or _is_musa
         ) and graph_supported_backend
+        supports_fa3_draft_extend_graph = (
+            _supports_fa3_draft_extend_cuda_graph(self.draft_extend_attn_backend)
+        )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
         if (
@@ -456,6 +506,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 _is_npu
                 or _is_xpu
                 or supports_cuda_draft_extend_graph
+                or supports_fa3_draft_extend_graph
                 or supports_hip_draft_extend_graph
             )
         ):
@@ -1053,6 +1104,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        # Overlap retains two forward generations. Alternate grow-only arenas
+        # so the next pack cannot overwrite tensors from the previous target.
+        self._spec_mixed_pack_scratch_slots = [
+            ForwardCompositionTensorScratch(),
+            ForwardCompositionTensorScratch(),
+        ]
+        self._spec_mixed_pack_scratch_cursor = 0
 
     @property
     def war_fastpath_runner(self):
@@ -1105,6 +1163,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
     ):
+        if batch.spec_mixed_prefill_batch is not None:
+            return self._forward_batch_spec_mixed(
+                batch,
+                on_publish=on_publish,
+                grammar_barrier=grammar_barrier,
+            )
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -1198,6 +1262,378 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output
+
+    def _forward_batch_spec_mixed(
+        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+    ) -> GenerationBatchResult:
+        """Run one eager packed target forward for prefill plus target verify."""
+        prefill_batch = batch.spec_mixed_prefill_batch
+        verify_batch = batch.spec_mixed_verify_batch
+        if prefill_batch is None or verify_batch is None:
+            raise ValueError("Speculative mixed batch requires both source views")
+        if self.topk != 1:
+            raise NotImplementedError(
+                "Speculative mixed batching currently requires topk=1"
+            )
+        target_backend = self.target_worker.model_runner.attn_backend
+        if not target_backend.supports_forward_composition(
+            "prefill_spec_verify",
+            topk=self.topk,
+            fixed_q_len=self.speculative_num_draft_tokens,
+        ):
+            raise NotImplementedError(
+                "The active target attention backend cannot run spec mixed composition"
+            )
+
+        prefill_forward_batch = ForwardBatch.init_new(
+            prefill_batch,
+            self.target_worker.model_runner,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_hidden_states_before_norm=False,
+        )
+
+        self.activate_step_by_batch(verify_batch.seq_lens.shape[0])
+        if verify_batch.spec_info is None:
+            raise RuntimeError("Speculative mixed verify view has no draft state")
+        with (
+            self.draft_worker.draft_tp_context(self.draft_worker.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft"),
+        ):
+            verify_input: EagleVerifyInput = self.draft_worker.draft(verify_batch)
+        verify_batch.spec_info = verify_input
+
+        with self.plan_stream_ctx:
+            verify_forward_batch, _ = eagle_prepare_for_verify(
+                verify_input,
+                self.req_to_token_pool,
+                verify_batch,
+                self.target_worker,
+                allow_cuda_graph=False,
+            )
+        if self.plan_stream:
+            torch.get_device_module(self.device).current_stream().wait_stream(
+                self.plan_stream
+            )
+
+        pack_scratch = self._spec_mixed_pack_scratch_slots[
+            self._spec_mixed_pack_scratch_cursor
+        ]
+        self._spec_mixed_pack_scratch_cursor = (
+            self._spec_mixed_pack_scratch_cursor + 1
+        ) % len(self._spec_mixed_pack_scratch_slots)
+        packed_forward_batch = pack_prefill_and_verify_forward(
+            prefill_forward_batch, verify_forward_batch, scratch=pack_scratch
+        )
+        parity_dir = parity_output_dir()
+        parity_index = getattr(self, "_spec_mixed_parity_index", 0)
+        parity_enabled = parity_dir is not None and parity_index < parity_max_steps()
+        operator_enabled = parity_enabled and operator_parity_enabled()
+        operator_handles = (
+            install_operator_trace_hooks(self.target_worker.model_runner.model)
+            if operator_enabled
+            else []
+        )
+        try:
+            parity_state = None
+            if parity_enabled:
+                parity_state = self._run_spec_mixed_reference(
+                    prefill_forward_batch,
+                    verify_forward_batch,
+                    operator_enabled=operator_enabled,
+                )
+
+            candidate_attention = AttentionTrace() if parity_enabled else None
+            candidate_operator = OperatorTrace() if operator_enabled else None
+            candidate_trace_ctx = (
+                record_attention(candidate_attention)
+                if candidate_attention is not None
+                else contextlib.nullcontext()
+            )
+            candidate_operator_ctx = (
+                record_operators(
+                    candidate_operator, prefill_forward_batch.input_ids.shape[0]
+                )
+                if candidate_operator is not None
+                else contextlib.nullcontext()
+            )
+            with candidate_trace_ctx, candidate_operator_ctx:
+                packed_target_result = self.target_worker.forward_batch_generation(
+                    batch=None,
+                    forward_batch=packed_forward_batch,
+                    is_verify=True,
+                )
+            self._last_spec_mixed_cuda_graph = packed_target_result.can_run_cuda_graph
+
+            if parity_state is not None:
+                self._finish_spec_mixed_parity(
+                    parity_dir,
+                    parity_index,
+                    parity_state,
+                    candidate_attention,
+                    candidate_operator,
+                    packed_target_result.logits_output.next_token_logits,
+                    prefill_forward_batch,
+                    verify_forward_batch,
+                )
+                self._spec_mixed_parity_index = parity_index + 1
+        finally:
+            remove_operator_trace_hooks(operator_handles)
+        prefill_logits, verify_logits = split_composition_logits_output(
+            packed_target_result.logits_output,
+            prefill_requests=prefill_forward_batch.batch_size,
+            prefill_tokens=prefill_forward_batch.input_ids.shape[0],
+            verify_tokens=verify_forward_batch.input_ids.shape[0],
+        )
+
+        prefill_next_token_ids = self.target_worker.model_runner.sample(
+            prefill_logits, prefill_forward_batch
+        )
+        prefill_result = GenerationBatchResult(
+            logits_output=prefill_logits,
+            next_token_ids=prefill_next_token_ids,
+            new_seq_lens=prefill_batch.seq_lens,
+        )
+        prefill_result.can_run_cuda_graph = packed_target_result.can_run_cuda_graph
+
+        verify_target_result = GenerationBatchResult(logits_output=verify_logits)
+        verify_result = run_eagle_verify(
+            verify_batch,
+            target_worker=self.target_worker,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            plan_stream=self.plan_stream,
+            plan_stream_ctx=self.plan_stream_ctx,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            device=self.device,
+            metadata_ready_pre_pad=False,
+            finalize_tree_path=True,
+            grammar_barrier=grammar_barrier,
+            prepared_verify_forward_batch=verify_forward_batch,
+            precomputed_forward_batch_output=verify_target_result,
+        )
+        verify_result.can_run_cuda_graph = packed_target_result.can_run_cuda_graph
+
+        combined_seq_lens = torch.cat(
+            (prefill_result.new_seq_lens, verify_result.new_seq_lens)
+        )
+        if on_publish is not None:
+            on_publish(combined_seq_lens)
+
+        with (
+            self.draft_worker.draft_tp_context(self.draft_worker.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft_extend"),
+        ):
+            prefill_next_draft = self.draft_worker._draft_extend_for_prefill(
+                prefill_batch,
+                prefill_logits.hidden_states,
+                prefill_next_token_ids,
+                prefill_logits.mm_input_embeds,
+            )
+            self.draft_worker._draft_extend_for_decode(verify_batch, verify_result)
+
+        verify_next_draft = verify_result.next_draft_input
+        # Keep per-role next-state objects on the source batches that the
+        # scheduler will actually return to the prefill/running queues. Build
+        # the parent relay state from a shallow dataclass copy so merge_batch
+        # only creates concatenated tensor handles and cannot turn either child
+        # back into a combined view.
+        merged_next_draft = replace(prefill_next_draft)
+        merged_next_draft.merge_batch(verify_next_draft)
+        for source_batch, next_draft in (
+            (prefill_batch, prefill_next_draft),
+            (verify_batch, verify_next_draft),
+        ):
+            next_draft.future_indices = source_batch.req_pool_indices
+            next_draft.future_dsa_topk_indices_available = (
+                next_draft.dsa_topk_indices is not None
+            )
+            source_batch.spec_info = next_draft
+        return GenerationBatchResult(
+            logits_output=packed_target_result.logits_output,
+            next_draft_input=merged_next_draft,
+            new_seq_lens=combined_seq_lens,
+            spec_mixed_prefill_result=prefill_result,
+            spec_mixed_verify_result=verify_result,
+            routed_experts_output=packed_target_result.routed_experts_output,
+            indexer_topk_output=packed_target_result.indexer_topk_output,
+            extra_keep_alive_refs=[
+                packed_forward_batch,
+                prefill_forward_batch,
+                verify_forward_batch,
+            ],
+            can_run_cuda_graph=packed_target_result.can_run_cuda_graph,
+        )
+
+    def _target_eager_forward_for_parity(self, forward_batch: ForwardBatch):
+        """Run the target eager path without sampling or scheduler mutation."""
+        runner = self.target_worker.model_runner
+        with forward_context(ForwardContext(attn_backend=runner.attn_backend)):
+            return runner.eager_runner.execute(forward_batch)
+
+    def _run_spec_mixed_reference(
+        self,
+        prefill_forward_batch: ForwardBatch,
+        verify_forward_batch: ForwardBatch,
+        operator_enabled: bool = False,
+    ) -> dict:
+        """Run separated eager forwards, then restore the touched target KV rows."""
+        runner = self.target_worker.model_runner
+        pool = runner.token_to_kv_pool
+        layer_ids = [
+            layer.layer_id for layer in runner.attention_layers if layer is not None
+        ]
+        locations = torch.cat(
+            (prefill_forward_batch.out_cache_loc, verify_forward_batch.out_cache_loc)
+        )
+        initial_kv = KVRows.capture(pool, layer_ids, locations)
+        reference_attention = AttentionTrace()
+        reference_operator = OperatorTrace() if operator_enabled else None
+        with record_attention(reference_attention):
+            prefill_output = self._target_eager_forward_for_parity(
+                prefill_forward_batch
+            )
+            # Clone before the next eager call can reuse a shared logits buffer.
+            prefill_logits = prefill_output.next_token_logits.detach().clone()
+            operator_ctx = (
+                record_operators(reference_operator, 0)
+                if reference_operator is not None
+                else contextlib.nullcontext()
+            )
+            with operator_ctx:
+                verify_output = self._target_eager_forward_for_parity(
+                    verify_forward_batch
+                )
+            verify_logits = verify_output.next_token_logits.detach().clone()
+
+        reference_kv = KVRows.capture(pool, layer_ids, locations)
+        initial_kv.restore(pool)
+        return {
+            "attention": reference_attention,
+            "operator": reference_operator,
+            "kv": reference_kv,
+            "logits": torch.cat((prefill_logits, verify_logits), dim=0),
+        }
+
+    def _finish_spec_mixed_parity(
+        self,
+        output_dir,
+        parity_index: int,
+        reference: dict,
+        candidate_attention: AttentionTrace,
+        candidate_operator: Optional[OperatorTrace],
+        candidate_logits: torch.Tensor,
+        prefill_forward_batch: ForwardBatch,
+        verify_forward_batch: ForwardBatch,
+    ) -> None:
+        runner = self.target_worker.model_runner
+        locations = torch.cat(
+            (prefill_forward_batch.out_cache_loc, verify_forward_batch.out_cache_loc)
+        )
+        layer_ids = [
+            layer.layer_id for layer in runner.attention_layers if layer is not None
+        ]
+        candidate_kv = KVRows.capture(runner.token_to_kv_pool, layer_ids, locations)
+        prefill_locations = prefill_forward_batch.out_cache_loc
+        verify_locations = verify_forward_batch.out_cache_loc
+        cross_segment_overlap = torch.isin(
+            prefill_locations, verify_locations
+        )
+        overlap_locations = prefill_locations[cross_segment_overlap]
+
+        def count_history_overlaps(
+            child: ForwardBatch, per_request_widths: list[int], history_lens: torch.Tensor
+        ) -> tuple[int, Optional[int]]:
+            total = 0
+            first = None
+            offset = 0
+            for request_index, width in enumerate(per_request_widths):
+                width = int(width)
+                writes = child.out_cache_loc[offset : offset + width]
+                offset += width
+                history_len = int(history_lens[request_index])
+                history = runner.req_to_token_pool.req_to_token[
+                    child.req_pool_indices[request_index], :history_len
+                ]
+                collisions = writes[torch.isin(writes, history)]
+                if collisions.numel() > 0 and first is None:
+                    first = int(collisions[0])
+                total += int(collisions.numel())
+            return total, first
+
+        prefill_history_overlap = count_history_overlaps(
+            prefill_forward_batch,
+            list(prefill_forward_batch.extend_seq_lens_cpu),
+            prefill_forward_batch.extend_prefix_lens,
+        )
+        verify_width = verify_forward_batch.input_ids.shape[0] // max(
+            verify_forward_batch.batch_size, 1
+        )
+        verify_history_overlap = count_history_overlaps(
+            verify_forward_batch,
+            [verify_width] * verify_forward_batch.batch_size,
+            verify_forward_batch.seq_lens,
+        )
+        logits_report = logits_parity(reference["logits"], candidate_logits)
+        first_row = logits_report["first_divergent_row"]
+        prefill_rows = prefill_forward_batch.batch_size
+        if first_row is not None:
+            if first_row < prefill_rows:
+                row_location = {
+                    "segment": "prefill",
+                    "request_index": first_row,
+                }
+            else:
+                verify_row = first_row - prefill_rows
+                width = verify_forward_batch.input_ids.shape[0] // max(
+                    verify_forward_batch.batch_size, 1
+                )
+                row_location = {
+                    "segment": "verify",
+                    "request_index": verify_row // width,
+                    "draft_index": verify_row % width,
+                }
+            logits_report["first_divergence"]["location"] = row_location
+
+        report = {
+            "device": torch.cuda.get_device_name(runner.device),
+            "dtype": str(runner.dtype),
+            "prefill_requests": prefill_forward_batch.batch_size,
+            "prefill_tokens": prefill_forward_batch.input_ids.shape[0],
+            "verify_requests": verify_forward_batch.batch_size,
+            "verify_tokens": verify_forward_batch.input_ids.shape[0],
+            "candidate_used_cuda_graph": bool(
+                getattr(self, "_last_spec_mixed_cuda_graph", False)
+            ),
+            "out_cache_loc": {
+                "prefill_unique": int(torch.unique(prefill_locations).numel()),
+                "verify_unique": int(torch.unique(verify_locations).numel()),
+                "cross_segment_overlap_count": int(overlap_locations.numel()),
+                "first_cross_segment_overlap": (
+                    int(overlap_locations[0])
+                    if overlap_locations.numel() > 0
+                    else None
+                ),
+                "prefill_history_overlap_count": prefill_history_overlap[0],
+                "first_prefill_history_overlap": prefill_history_overlap[1],
+                "verify_history_overlap_count": verify_history_overlap[0],
+                "first_verify_history_overlap": verify_history_overlap[1],
+            },
+            "logits": logits_report,
+            "attention": attention_parity(reference["attention"], candidate_attention),
+            "kv": reference["kv"].compare(candidate_kv),
+        }
+        if reference["operator"] is not None:
+            report["operator"] = operator_parity(
+                reference["operator"], candidate_operator
+            )
+        path = write_parity_report(output_dir, parity_index, report)
+        logger.info("Wrote speculative mixed GPU parity report to %s", path)
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.

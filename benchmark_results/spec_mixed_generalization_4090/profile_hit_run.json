@@ -1,0 +1,13 @@
+{
+  "kind": "hit",
+  "num_steps": 120,
+  "request_count": 16,
+  "profile_response": {
+    "start_response": "Start profiling.\n",
+    "stop_status": 200,
+    "stop_response": "Stop profiling. This will take some time.\n"
+  },
+  "traces": [
+    "benchmark_results/spec_mixed_generalization_4090/profiler_hit_final/prefix-hit-1786892157.2791393-TP-0.trace.json.gz"
+  ]
+}

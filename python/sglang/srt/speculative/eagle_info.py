@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
-
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
@@ -173,6 +172,13 @@ class EagleDraftInput(SpecInput):
 
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
+    future_indices_cpu: Optional[torch.Tensor] = None
+    # CPU-side ABA/version ticket for the payload addressed by future_indices.
+    # req_generation distinguishes slot reuse; producer_forward distinguishes
+    # two successive payloads belonging to the same live request.
+    future_generations: Optional[torch.Tensor] = None
+    future_producer_forwards: Optional[torch.Tensor] = None
+    future_producer_modes: Optional[list[str]] = None
     future_dsa_topk_indices_available: bool = False
 
     def __post_init__(self):
@@ -212,6 +218,22 @@ class EagleDraftInput(SpecInput):
     ):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
+            if self.future_indices_cpu is not None:
+                assert new_indices_cpu is not None
+                self.future_indices_cpu = self.future_indices_cpu[new_indices_cpu]
+            if self.future_generations is not None:
+                assert new_indices_cpu is not None
+                self.future_generations = self.future_generations[new_indices_cpu]
+            if self.future_producer_forwards is not None:
+                assert new_indices_cpu is not None
+                self.future_producer_forwards = self.future_producer_forwards[
+                    new_indices_cpu
+                ]
+            if self.future_producer_modes is not None:
+                assert new_indices_cpu is not None
+                self.future_producer_modes = [
+                    self.future_producer_modes[i] for i in new_indices_cpu
+                ]
             return
 
         self.topk_p = self.topk_p[new_indices]
@@ -230,6 +252,29 @@ class EagleDraftInput(SpecInput):
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
             )
+            if self.future_indices_cpu is not None:
+                assert spec_info.future_indices_cpu is not None
+                self.future_indices_cpu = torch.cat(
+                    [self.future_indices_cpu, spec_info.future_indices_cpu]
+                )
+            if self.future_generations is not None:
+                assert spec_info.future_generations is not None
+                self.future_generations = torch.cat(
+                    [self.future_generations, spec_info.future_generations]
+                )
+            if self.future_producer_forwards is not None:
+                assert spec_info.future_producer_forwards is not None
+                self.future_producer_forwards = torch.cat(
+                    [
+                        self.future_producer_forwards,
+                        spec_info.future_producer_forwards,
+                    ]
+                )
+            if self.future_producer_modes is not None:
+                assert spec_info.future_producer_modes is not None
+                self.future_producer_modes = (
+                    self.future_producer_modes + spec_info.future_producer_modes
+                )
             self.future_dsa_topk_indices_available = (
                 self.future_dsa_topk_indices_available
                 and spec_info.future_dsa_topk_indices_available

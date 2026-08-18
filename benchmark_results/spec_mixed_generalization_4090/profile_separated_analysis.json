@@ -1,0 +1,97 @@
+{
+  "trace": "benchmark_results/spec_mixed_generalization_4090/profiler_separated_final/prefix-hit-1786892609.2037597-TP-0.trace.json.gz",
+  "event_count": 279217,
+  "steps": {
+    "EXTEND": {
+      "duration": {
+        "count": 18,
+        "mean_ms": 10.526191555555554,
+        "p50_ms": 9.960202,
+        "p90_ms": 20.164234,
+        "p99_ms": 21.18801,
+        "min_ms": 1.9358440000000001,
+        "max_ms": 21.18801
+      },
+      "batch_sizes": {
+        "1": 6,
+        "2": 10,
+        "3": 2
+      }
+    },
+    "TARGET_VERIFY": {
+      "duration": {
+        "count": 60,
+        "mean_ms": 1.7366249166666667,
+        "p50_ms": 1.3964745,
+        "p90_ms": 3.2053649999999996,
+        "p99_ms": 5.790322,
+        "min_ms": 1.2930050000000002,
+        "max_ms": 5.790322
+      },
+      "batch_sizes": {
+        "1": 2,
+        "2": 3,
+        "4": 50,
+        "9": 1,
+        "16": 4
+      }
+    }
+  },
+  "mixed": {
+    "cpu_duration": {
+      "count": 0,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p90_ms": null,
+      "p99_ms": null,
+      "min_ms": null,
+      "max_ms": null
+    },
+    "gpu_duration": {
+      "count": 0,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p90_ms": null,
+      "p99_ms": null,
+      "min_ms": null,
+      "max_ms": null
+    },
+    "pre_model_cpu": {
+      "count": 0,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p90_ms": null,
+      "p99_ms": null,
+      "min_ms": null,
+      "max_ms": null
+    },
+    "pre_attention_cpu": {
+      "count": 0,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p90_ms": null,
+      "p99_ms": null,
+      "min_ms": null,
+      "max_ms": null
+    },
+    "gpu_tail_after_cpu_submission": {
+      "count": 0,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p90_ms": null,
+      "p99_ms": null,
+      "min_ms": null,
+      "max_ms": null
+    },
+    "cpu_submission_hidden_count": 0,
+    "cpu_submission_pair_count": 0,
+    "forbidden_sync_counts": {},
+    "pre_model_pack_operator_counts": {},
+    "whole_step_pack_operator_counts": {},
+    "launched_memcpy_counts": {},
+    "launched_memcpy_bytes": {},
+    "cuda_launch_count": 0,
+    "top_cpu_ops_inclusive_us": [],
+    "top_gpu_kernel_groups_us": []
+  }
+}

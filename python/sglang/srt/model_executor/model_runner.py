@@ -762,10 +762,20 @@ class ModelRunner:
             self.init_lora_manager()
 
     def maybe_enable_batch_invariant_mode(self):
-        if get_exec().deterministic.enable_deterministic_inference:
+        deterministic = get_exec().deterministic.enable_deterministic_inference
+        spec_mixed_batch_invariant = (
+            envs.SGLANG_SPEC_MIXED_BATCH_INVARIANT.get()
+            and self.server_args.speculative_algorithm in ("EAGLE", "EAGLE3")
+        )
+        if deterministic or spec_mixed_batch_invariant:
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
+            if spec_mixed_batch_invariant and not deterministic:
+                logger.warning(
+                    "Enabled batch-invariant dense operators for strict "
+                    "speculative mixed parity."
+                )
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_topk_size(

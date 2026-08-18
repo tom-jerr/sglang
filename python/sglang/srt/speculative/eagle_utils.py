@@ -495,6 +495,7 @@ def eagle_prepare_for_verify(
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
+    allow_cuda_graph: bool = True,
 ):
     from sglang.kernels.ops.speculative.cache_locs import (
         assign_extend_cache_locs_uniform_func,
@@ -559,7 +560,8 @@ def eagle_prepare_for_verify(
 
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(
-        target_worker.model_runner.decode_cuda_graph_runner
+        allow_cuda_graph
+        and target_worker.model_runner.decode_cuda_graph_runner
         and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
             verify_forward_batch
         )

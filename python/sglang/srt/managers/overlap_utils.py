@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip, is_npu
@@ -81,12 +83,36 @@ def _assert_nonneg_and_invalidate(
     buf[indices] = -1
 
 
-def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
+def resolve_forward_inputs(
+    batch: ScheduleBatch,
+    future_map: FutureMap,
+    *,
+    resolve_spec_extras: bool = True,
+) -> None:
     """Materialize input_ids at forward entry. Two sources:
 
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
     - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
     """
+    if batch.spec_mixed_prefill_batch is not None:
+        if batch.spec_mixed_verify_batch is None:
+            raise ValueError("Speculative mixed batch is missing its verify view")
+        # The prefill child may carry EagleDraftExtendInput left by the prior
+        # chunk. It only needs pinned-token materialization; draft-extend will
+        # replace that state after the target forward. Only the verify child
+        # consumes the previous iteration's speculative future relay.
+        resolve_forward_inputs(
+            batch.spec_mixed_prefill_batch,
+            future_map,
+            resolve_spec_extras=False,
+        )
+        resolve_forward_inputs(
+            batch.spec_mixed_verify_batch,
+            future_map,
+            resolve_spec_extras=True,
+        )
+        return
+
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:
@@ -111,7 +137,11 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
 
     # Only the overlap path relays spec extras through the future_map; the
     # synchronous (non-overlap) V2 path installs next_draft_input directly.
-    if batch.enable_overlap and not batch.spec_algorithm.is_none():
+    if (
+        resolve_spec_extras
+        and batch.enable_overlap
+        and not batch.spec_algorithm.is_none()
+    ):
         future_map._resolve_spec_extras(batch)
 
 
@@ -120,7 +150,6 @@ CONFIDENCE_RELAY_RING_DEPTH: int = CONFIDENCE_RELAY_RING_LAG + 1
 
 
 class ResolvedConfidence(msgspec.Struct):
-
     confidence: torch.Tensor
     generation: torch.Tensor
 
@@ -151,7 +180,6 @@ class RelayPayload:
 
 
 class ConfidenceRelay(msgspec.Struct):
-
     device: torch.device
     req_pool_size: int
     pool: Any
@@ -241,11 +269,22 @@ class FutureMap:
         req_to_token_pool: ReqToTokenPool,
         needs_cpu_seq_lens: bool = True,
         needs_confidence_relay: bool = False,
+        relay_tickets_enabled: bool = False,
     ):
         # Bufs indexed by req_pool_idx; slot 0 mirrors KV padding row so
         # CUDA-graph padded batches (req_pool_idx == 0) are harmless.
         self.device = device
         self.spec_algo = spec_algo
+        self.req_to_token_pool = req_to_token_pool
+        relay_parity_dir = os.environ.get("SGLANG_SPEC_RELAY_PARITY_DIR")
+        self.relay_parity_dir = Path(relay_parity_dir) if relay_parity_dir else None
+        # Keep the ordinary EAGLE path free of CPU ticket allocation/copies.
+        # Mixed, CI and the explicit parity probe opt into ABA diagnostics.
+        self.relay_tickets_enabled = spec_algo.is_eagle() and (
+            relay_tickets_enabled
+            or _DEBUG_ASSERT
+            or self.relay_parity_dir is not None
+        )
         # Computed by decide_needs_cpu_seq_lens(); see that helper for the
         # full decision (per-backend flag + TBO / piecewise CG overrides).
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
@@ -284,6 +323,26 @@ class FutureMap:
         self.dsa_topk_indices_buf = None
 
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
+        self.committed_generations = None
+        self.committed_producer_forwards = None
+        self.published_generations = None
+        self.published_producer_forwards = None
+        if self.relay_tickets_enabled:
+            self.committed_generations = torch.full(
+                (self.req_pool_size,), -1, dtype=torch.int64
+            )
+            self.committed_producer_forwards = torch.full(
+                (self.req_pool_size,), -1, dtype=torch.int64
+            )
+            self.published_generations = torch.full(
+                (self.req_pool_size,), -1, dtype=torch.int64
+            )
+            self.published_producer_forwards = torch.full(
+                (self.req_pool_size,), -1, dtype=torch.int64
+            )
+        self._relay_consume_index = 0
+        if self.relay_parity_dir is not None:
+            self.relay_parity_dir.mkdir(parents=True, exist_ok=True)
         # Debug consume-once state: armed by a recording publish, consumed by
         # resolve; arm/consume strictly alternate across all batch interleavings.
         self._publish_fresh = False
@@ -413,6 +472,33 @@ class FutureMap:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
         # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
+        if batch.spec_mixed_prefill_batch is not None:
+            verify_batch = batch.spec_mixed_verify_batch
+            if verify_batch is None:
+                raise ValueError("Speculative mixed batch is missing its verify view")
+            # mix_with_spec_running() creates the role children before run_batch
+            # resolves the prior forward's accepted lengths.  Resolving only the
+            # parent would rebind parent.seq_lens while the shallow-copied verify
+            # child kept the old tensor.  The worker consumes the child, so resolve
+            # that generation directly, then rebuild the parent from both roles.
+            self.resolve_seq_lens_cpu(verify_batch)
+            prefill_batch = batch.spec_mixed_prefill_batch
+            batch.seq_lens = torch.cat(
+                (prefill_batch.seq_lens, verify_batch.seq_lens)
+            )
+            if (
+                prefill_batch.seq_lens_cpu is None
+                or verify_batch.seq_lens_cpu is None
+            ):
+                batch.seq_lens_cpu = None
+                batch.seq_lens_sum = None
+            else:
+                batch.seq_lens_cpu = torch.cat(
+                    (prefill_batch.seq_lens_cpu, verify_batch.seq_lens_cpu)
+                )
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            return
+
         draft_input = batch.spec_info
         if draft_input is None:
             return
@@ -420,6 +506,8 @@ class FutureMap:
         fi = draft_input.future_indices
         if fi is None:
             return
+        if self.relay_tickets_enabled:
+            self._validate_relay_ticket(batch, draft_input)
         if self.publish_ready is not None:
             if _DEBUG_ASSERT:
                 # Consume-once: every event wait must be re-armed by a fresh
@@ -472,11 +560,27 @@ class FutureMap:
         future_indices: torch.Tensor,
         new_seq_lens: torch.Tensor,
         confidence: Optional[torch.Tensor] = None,
+        *,
+        future_indices_cpu: Optional[torch.Tensor] = None,
+        generations: Optional[torch.Tensor] = None,
+        producer_forwards: Optional[torch.Tensor] = None,
     ) -> None:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
+        if self.relay_tickets_enabled:
+            if future_indices_cpu is None:
+                future_indices_cpu = indices.to("cpu")
+            future_indices_cpu = future_indices_cpu.to(torch.int64)
+            if generations is None:
+                generations = self.req_to_token_pool.req_generation[
+                    future_indices_cpu
+                ].clone()
+            if producer_forwards is None:
+                producer_forwards = torch.full_like(generations, -1)
+            self.published_generations[future_indices_cpu] = generations
+            self.published_producer_forwards[future_indices_cpu] = producer_forwards
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
@@ -498,7 +602,15 @@ class FutureMap:
                 publish_ready=self.publish_ready,
             )
 
-    def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
+    def stash(
+        self,
+        future_indices: torch.Tensor,
+        payload: RelayPayload,
+        *,
+        future_indices_cpu: Optional[torch.Tensor] = None,
+        generations: Optional[torch.Tensor] = None,
+        producer_forwards: Optional[torch.Tensor] = None,
+    ) -> None:
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.
             return
@@ -530,4 +642,83 @@ class FutureMap:
         ):
             self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
                 self.dsa_topk_indices_buf.dtype
+            )
+
+        if self.relay_tickets_enabled:
+            if future_indices_cpu is None:
+                future_indices_cpu = indices.to("cpu")
+            future_indices_cpu = future_indices_cpu.to(torch.int64)
+            if generations is None:
+                generations = self.req_to_token_pool.req_generation[
+                    future_indices_cpu
+                ].clone()
+            if producer_forwards is None:
+                producer_forwards = torch.full_like(generations, -1)
+            if not (
+                len(future_indices_cpu)
+                == len(generations)
+                == len(producer_forwards)
+            ):
+                raise ValueError("Relay commit ticket length does not match payload rows")
+            self.committed_generations[future_indices_cpu] = generations
+            self.committed_producer_forwards[future_indices_cpu] = producer_forwards
+
+    def _validate_relay_ticket(
+        self, batch: ScheduleBatch, draft_input: EagleDraftInput
+    ) -> None:
+        """Reject stale/overwritten pool rows before gathering draft state."""
+        expected_gen = draft_input.future_generations
+        expected_forward = draft_input.future_producer_forwards
+        if expected_gen is None or expected_forward is None:
+            raise RuntimeError("Spec relay payload is missing its generation ticket")
+
+        rows = batch.req_pool_indices_cpu.to(torch.int64)
+        future_rows = draft_input.future_indices_cpu
+        if future_rows is None:
+            raise RuntimeError("Spec relay payload is missing its CPU slot ticket")
+        future_rows = future_rows.to(torch.int64)
+        current_gen = self.req_to_token_pool.req_generation[rows]
+        committed_gen = self.committed_generations[future_rows]
+        committed_forward = self.committed_producer_forwards[future_rows]
+        published_gen = self.published_generations[future_rows]
+        published_forward = self.published_producer_forwards[future_rows]
+        checks = {
+            "row_order": torch.equal(future_rows, rows),
+            "current_generation": torch.equal(expected_gen, current_gen),
+            "committed_generation": torch.equal(expected_gen, committed_gen),
+            "producer_forward": torch.equal(expected_forward, committed_forward),
+            "seq_generation": torch.equal(expected_gen, published_gen),
+            "seq_producer_forward": torch.equal(
+                expected_forward, published_forward
+            ),
+        }
+        failed = [name for name, passed in checks.items() if not passed]
+        if self.relay_parity_dir is None and not failed:
+            return
+        report = {
+            "consume_index": self._relay_consume_index,
+            "consumer_forward": int(getattr(batch, "forward_iter", -1)),
+            "consumer_mode": str(batch.forward_mode),
+            "request_ids": [str(req.rid) for req in batch.reqs],
+            "future_rows": future_rows.tolist(),
+            "batch_rows": rows.tolist(),
+            "expected_generations": expected_gen.tolist(),
+            "current_generations": current_gen.tolist(),
+            "committed_generations": committed_gen.tolist(),
+            "expected_producer_forwards": expected_forward.tolist(),
+            "committed_producer_forwards": committed_forward.tolist(),
+            "published_generations": published_gen.tolist(),
+            "published_producer_forwards": published_forward.tolist(),
+            "producer_modes": draft_input.future_producer_modes,
+            "checks": checks,
+        }
+        self._relay_consume_index += 1
+        if self.relay_parity_dir is not None:
+            path = self.relay_parity_dir / "relay_generation_parity.jsonl"
+            with path.open("a", encoding="utf-8") as fout:
+                fout.write(json.dumps(report, ensure_ascii=False) + "\n")
+        if failed:
+            raise RuntimeError(
+                "Stale or overwritten speculative relay payload: "
+                f"failed={failed}, report={report}"
             )
