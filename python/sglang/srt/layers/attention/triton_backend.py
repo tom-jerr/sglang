@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import triton
@@ -114,6 +114,13 @@ class ForwardMetadata:
 class CompositePrefillVerifyMetadata:
     prefill: ForwardMetadata
     verify: ForwardMetadata
+    prefill_num_tokens: int
+    verify_num_tokens: int
+
+
+@dataclass
+class FusedForwardCompositionMetadata:
+    forward: ForwardMetadata
     prefill_num_tokens: int
     verify_num_tokens: int
 
@@ -382,9 +389,9 @@ class TritonAttnBackend(AttentionBackend):
         )
 
         self.forward_metadata: ForwardMetadata = None
-        self.forward_composition_metadata: Optional[CompositePrefillVerifyMetadata] = (
-            None
-        )
+        self.forward_composition_metadata: Optional[
+            Union[CompositePrefillVerifyMetadata, FusedForwardCompositionMetadata]
+        ] = None
         # Two slots keep the next planning pass from overwriting indptr storage
         # that the current forward may still consume. Each slot owns one storage
         # per dtype and exposes disjoint prefill/verify views.
@@ -413,7 +420,16 @@ class TritonAttnBackend(AttentionBackend):
         self, kind: str, *, topk: int, fixed_q_len: int
     ) -> bool:
         return (
-            kind == "prefill_spec_verify"
+            (
+                (
+                    kind == "prefill_spec_verify"
+                    and not getattr(self, "is_draft_runner", False)
+                )
+                or (
+                    kind == "draft_prefill_decode_extend"
+                    and getattr(self, "is_draft_runner", False)
+                )
+            )
             and topk == 1
             and fixed_q_len > 0
             and self.dcp_size == 1
@@ -421,6 +437,13 @@ class TritonAttnBackend(AttentionBackend):
                 self.sliding_window_size is not None and self.sliding_window_size > 0
             )
         )
+
+    def supports_fused_forward_composition(
+        self, kind: str, *, topk: int, fixed_q_len: int
+    ) -> bool:
+        return self.supports_forward_composition(
+            kind, topk=topk, fixed_q_len=fixed_q_len
+        ) and not self.enable_deterministic
 
     def _acquire_forward_composition_scratch(
         self,
@@ -894,10 +917,32 @@ class TritonAttnBackend(AttentionBackend):
             fixed_q_len=fixed_q_len,
         ):
             raise NotImplementedError(
-                "Triton forward composition requires topk=1, fixed verify width, "
+                "Triton forward composition requires a supported target/draft role, "
+                "topk=1, fixed second-segment width, "
                 "DCP=1, non-deterministic attention, and no sliding window"
             )
         scratch = self._acquire_forward_composition_scratch()
+        if composition.fused_attention:
+            if not self.supports_fused_forward_composition(
+                composition.kind,
+                topk=self.topk,
+                fixed_q_len=fixed_q_len,
+            ):
+                raise NotImplementedError(
+                    "Triton cannot fuse this forward composition into one attention call"
+                )
+            total_kv_capacity = forward_batch.batch_size * self.max_context_len
+            fused_scratch, _ = scratch.segments(total_kv_capacity, 0)
+            fused_metadata = self._build_forward_metadata(
+                forward_batch, fused_scratch
+            )
+            self.forward_composition_metadata = FusedForwardCompositionMetadata(
+                forward=fused_metadata,
+                prefill_num_tokens=composition.prefill_num_tokens,
+                verify_num_tokens=composition.verify_num_tokens,
+            )
+            self.forward_metadata = fused_metadata
+            return
         # GPU-only planning: use a safe, host-known capacity.  The ragged
         # builders write the actual used extent into kv_indptr on the device.
         # Slots grow only when request count grows and are then reused.
@@ -1730,6 +1775,25 @@ class TritonAttnBackend(AttentionBackend):
             raise NotImplementedError(
                 "Triton forward composition does not support score_mod/aux_tensors"
             )
+
+        if isinstance(metadata, FusedForwardCompositionMetadata):
+            saved_composition = forward_batch.composition
+            forward_batch.composition = None
+            try:
+                return self.forward_extend(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    sinks=sinks,
+                    score_mod=score_mod,
+                    aux_tensors=aux_tensors,
+                    forward_metadata=metadata.forward,
+                )
+            finally:
+                forward_batch.composition = saved_composition
 
         prefill_end = metadata.prefill_num_tokens
 

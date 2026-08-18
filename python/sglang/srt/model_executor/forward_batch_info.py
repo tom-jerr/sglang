@@ -494,6 +494,7 @@ class ForwardComposition:
     verify_num_tokens: int
     logits_gather_indices: Optional[torch.Tensor] = None
     tensor_scratch: Optional[ForwardCompositionTensorScratch] = None
+    fused_attention: bool = False
 
     def validate(self, parent_num_tokens: int) -> None:
         if self.kind != "prefill_spec_verify":
@@ -558,6 +559,96 @@ class ForwardComposition:
             self.prefill_num_tokens,
             self.prefill_num_tokens + self.verify_num_tokens,
             out=indices[self.prefill_batch.batch_size :],
+        )
+        self.logits_gather_indices = indices
+        return indices
+
+
+@dataclass(slots=True)
+class DraftExtendComposition:
+    """Packed draft-prefill plus decode draft-extend runtime views."""
+
+    kind: str
+    prefill_batch: "ForwardBatch"
+    decode_extend_batch: "ForwardBatch"
+    prefill_num_tokens: int
+    decode_extend_num_tokens: int
+    decode_select_index: torch.Tensor
+    logits_gather_indices: Optional[torch.Tensor] = None
+    tensor_scratch: Optional[ForwardCompositionTensorScratch] = None
+    fused_attention: bool = True
+
+    # Compatibility aliases let attention backends share composition plumbing;
+    # role-specific validation remains here.
+    @property
+    def verify_batch(self) -> "ForwardBatch":
+        return self.decode_extend_batch
+
+    @property
+    def verify_num_tokens(self) -> int:
+        return self.decode_extend_num_tokens
+
+    def validate(self, parent_num_tokens: int) -> None:
+        if self.kind != "draft_prefill_decode_extend":
+            raise ValueError(f"Unsupported draft composition kind: {self.kind!r}")
+        if self.prefill_num_tokens <= 0 or self.decode_extend_num_tokens <= 0:
+            raise ValueError("Draft composition segments must both be non-empty")
+        if self.prefill_batch.forward_mode != ForwardMode.EXTEND:
+            raise ValueError("Draft-prefill composition segment must use EXTEND")
+        if not self.decode_extend_batch.forward_mode.is_draft_extend_v2():
+            raise ValueError(
+                "Decode draft-extend composition segment must use DRAFT_EXTEND_V2"
+            )
+        if (
+            self.prefill_num_tokens + self.decode_extend_num_tokens
+            != parent_num_tokens
+        ):
+            raise ValueError("Draft composition token counts do not match parent")
+        if self.prefill_batch.input_ids.shape[0] != self.prefill_num_tokens:
+            raise ValueError("Draft-prefill token count mismatch")
+        if (
+            self.decode_extend_batch.input_ids.shape[0]
+            != self.decode_extend_num_tokens
+        ):
+            raise ValueError("Decode draft-extend token count mismatch")
+        if self.decode_select_index.shape != (
+            self.decode_extend_batch.batch_size,
+        ):
+            raise ValueError("Decode select index must contain one row per request")
+
+    def build_logits_gather_indices(
+        self, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if self.logits_gather_indices is not None:
+            return self.logits_gather_indices
+        extend_seq_lens = self.prefill_batch.extend_seq_lens
+        if extend_seq_lens is None:
+            raise ValueError("Draft-prefill segment needs extend_seq_lens")
+        required = self.prefill_batch.batch_size + self.decode_extend_batch.batch_size
+        if out is None:
+            indices = torch.empty(
+                required, dtype=torch.int64, device=extend_seq_lens.device
+            )
+        else:
+            if (
+                out.shape != (required,)
+                or out.dtype != torch.int64
+                or out.device != extend_seq_lens.device
+            ):
+                raise ValueError("Draft composition gather scratch has wrong shape")
+            indices = out
+        prefill_bs = self.prefill_batch.batch_size
+        torch.cumsum(
+            extend_seq_lens,
+            dim=0,
+            dtype=torch.int64,
+            out=indices[:prefill_bs],
+        )
+        indices[:prefill_bs].sub_(1)
+        torch.add(
+            self.decode_select_index,
+            self.prefill_num_tokens,
+            out=indices[prefill_bs:],
         )
         self.logits_gather_indices = indices
         return indices
@@ -661,7 +752,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
     # Heterogeneous packed-forward runtime views. None for all existing paths.
-    composition: Optional[ForwardComposition] = None
+    composition: Optional[Union[ForwardComposition, DraftExtendComposition]] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA
@@ -1949,6 +2040,13 @@ def pack_prefill_and_verify_forward(
         raise ValueError("Composition segments must have materialized positions")
     if prefill_batch.out_cache_loc is None or verify_batch.out_cache_loc is None:
         raise ValueError("Composition segments must have output-cache locations")
+    verify_requests = verify_batch.batch_size
+    if verify_tokens % verify_requests != 0:
+        raise ValueError(
+            "Verify token count must be divisible by its request count: "
+            f"{verify_tokens} % {verify_requests} != 0"
+        )
+    verify_width = verify_tokens // verify_requests
 
     packed = copy.copy(prefill_batch)
     packed.forward_mode = ForwardMode.MIXED
@@ -1960,13 +2058,26 @@ def pack_prefill_and_verify_forward(
         "req_pool_indices",
         (prefill_batch.req_pool_indices, verify_batch.req_pool_indices)
     )
+    # TARGET_VERIFY.seq_lens is the committed prefix length before the verify
+    # window. Generic EXTEND/MIXED metadata instead expects the total KV length
+    # after its query window, so normalize the verify role on the parent only.
+    verify_total_seq_lens = scratch.tensor(
+        "verify_total_seq_lens",
+        tuple(verify_batch.seq_lens.shape),
+        dtype=verify_batch.seq_lens.dtype,
+        device=verify_batch.seq_lens.device,
+    )
+    torch.add(verify_batch.seq_lens, verify_width, out=verify_total_seq_lens)
     packed.seq_lens = scratch.pack(
-        "seq_lens", (prefill_batch.seq_lens, verify_batch.seq_lens)
+        "seq_lens", (prefill_batch.seq_lens, verify_total_seq_lens)
     )
     packed.seq_lens_cpu = (
         scratch.pack(
             "seq_lens_cpu",
-            (prefill_batch.seq_lens_cpu, verify_batch.seq_lens_cpu),
+            (
+                prefill_batch.seq_lens_cpu,
+                verify_batch.seq_lens_cpu + verify_width,
+            ),
         )
         if prefill_batch.seq_lens_cpu is not None
         and verify_batch.seq_lens_cpu is not None
@@ -1980,7 +2091,9 @@ def pack_prefill_and_verify_forward(
         "positions", (prefill_batch.positions, verify_batch.positions)
     )
     packed.seq_lens_sum = (
-        prefill_batch.seq_lens_sum + verify_batch.seq_lens_sum
+        prefill_batch.seq_lens_sum
+        + verify_batch.seq_lens_sum
+        + verify_tokens
         if prefill_batch.seq_lens_sum is not None
         and verify_batch.seq_lens_sum is not None
         else None
@@ -1990,13 +2103,6 @@ def pack_prefill_and_verify_forward(
     # the two composition views, but those parent fields still have to describe
     # all E + D requests (rather than aliasing the E-row prefill tensors).
     # TARGET_VERIFY has a uniform number of draft tokens per request.
-    verify_requests = verify_batch.batch_size
-    if verify_tokens % verify_requests != 0:
-        raise ValueError(
-            "Verify token count must be divisible by its request count: "
-            f"{verify_tokens} % {verify_requests} != 0"
-        )
-    verify_width = verify_tokens // verify_requests
     if prefill_batch.extend_seq_lens is None:
         raise ValueError("Prefill composition needs extend_seq_lens")
     verify_extend_seq_lens = scratch.tensor(
@@ -2023,10 +2129,8 @@ def pack_prefill_and_verify_forward(
         device=prefill_prefix_lens.device,
     )
     packed.extend_prefix_lens[: prefill_batch.batch_size].copy_(prefill_prefix_lens)
-    torch.sub(
-        verify_batch.seq_lens,
-        verify_width,
-        out=packed.extend_prefix_lens[prefill_batch.batch_size :],
+    packed.extend_prefix_lens[prefill_batch.batch_size :].copy_(
+        verify_batch.seq_lens
     )
     packed.extend_start_loc = scratch.tensor(
         "extend_start_loc",
@@ -2066,13 +2170,15 @@ def pack_prefill_and_verify_forward(
         packed.extend_prefix_lens_cpu = [
             *prefill_batch.extend_prefix_lens_cpu,
             *(
-                (verify_seq_lens_cpu - verify_width).tolist()
+                verify_seq_lens_cpu.tolist()
                 if verify_seq_lens_cpu is not None
-                else []
+                # FA3 only consumes these host values through any(...) to
+                # choose ragged-Q metadata.  A target-verify request always
+                # admits that representation; use a positive sentinel when
+                # its GPU-only child intentionally omitted the CPU mirror.
+                else [1] * verify_requests
             ),
         ]
-        if len(packed.extend_prefix_lens_cpu) != packed.batch_size:
-            packed.extend_prefix_lens_cpu = None
     else:
         packed.extend_prefix_lens_cpu = None
     packed.extend_logprob_start_lens_cpu = None
@@ -2123,6 +2229,163 @@ def pack_prefill_and_verify_forward(
     # The supported composition gate is single-GPU. BCG consumes live backend
     # metadata at its attention breaks, so the local graph vote is safe for
     # both Triton and FA3 composition implementations.
+    packed.can_run_dp_cuda_graph = True
+    packed.can_run_dp_breakable_cuda_graph = True
+    return packed
+
+
+def pack_draft_prefill_and_decode_extend_forward(
+    prefill_batch: ForwardBatch,
+    decode_extend_batch: ForwardBatch,
+    decode_select_index: torch.Tensor,
+    scratch: Optional[ForwardCompositionTensorScratch] = None,
+) -> ForwardBatch:
+    """Pack draft-prefill and decode draft-extend for one fused draft pass."""
+    if scratch is None:
+        scratch = ForwardCompositionTensorScratch()
+    prefill_tokens = prefill_batch.input_ids.shape[0]
+    decode_tokens = decode_extend_batch.input_ids.shape[0]
+    composition = DraftExtendComposition(
+        kind="draft_prefill_decode_extend",
+        prefill_batch=prefill_batch,
+        decode_extend_batch=decode_extend_batch,
+        prefill_num_tokens=prefill_tokens,
+        decode_extend_num_tokens=decode_tokens,
+        decode_select_index=decode_select_index,
+        tensor_scratch=scratch,
+    )
+    composition.validate(prefill_tokens + decode_tokens)
+    if prefill_batch.positions is None or decode_extend_batch.positions is None:
+        raise ValueError("Draft composition positions must be materialized")
+    if prefill_batch.out_cache_loc is None or decode_extend_batch.out_cache_loc is None:
+        raise ValueError("Draft composition output-cache locations are required")
+    prefill_spec = prefill_batch.spec_info
+    decode_spec = decode_extend_batch.spec_info
+    if prefill_spec is None or decode_spec is None:
+        raise ValueError("Draft composition children need speculative metadata")
+    if (
+        getattr(prefill_spec, "hidden_states", None) is None
+        or getattr(decode_spec, "hidden_states", None) is None
+    ):
+        raise ValueError("Draft composition children need target hidden states")
+    if prefill_spec.hidden_states.shape[0] != prefill_tokens:
+        raise ValueError("Draft-prefill hidden-state token count mismatch")
+    if decode_spec.hidden_states.shape[0] != decode_tokens:
+        raise ValueError("Decode draft-extend hidden-state token count mismatch")
+
+    packed = copy.copy(prefill_batch)
+    packed.forward_mode = ForwardMode.MIXED
+    packed.batch_size = prefill_batch.batch_size + decode_extend_batch.batch_size
+    for name in ("input_ids", "req_pool_indices", "seq_lens", "out_cache_loc", "positions"):
+        packed_value = scratch.pack(
+            name, (getattr(prefill_batch, name), getattr(decode_extend_batch, name))
+        )
+        setattr(packed, name, packed_value)
+    packed.seq_lens_cpu = (
+        scratch.pack(
+            "seq_lens_cpu",
+            (prefill_batch.seq_lens_cpu, decode_extend_batch.seq_lens_cpu),
+        )
+        if prefill_batch.seq_lens_cpu is not None
+        and decode_extend_batch.seq_lens_cpu is not None
+        else None
+    )
+    packed.seq_lens_sum = (
+        prefill_batch.seq_lens_sum + decode_extend_batch.seq_lens_sum
+        if prefill_batch.seq_lens_sum is not None
+        and decode_extend_batch.seq_lens_sum is not None
+        else None
+    )
+    if prefill_batch.extend_seq_lens is None or decode_extend_batch.extend_seq_lens is None:
+        raise ValueError("Draft composition children need extend_seq_lens")
+    packed.extend_seq_lens = scratch.pack(
+        "extend_seq_lens",
+        (prefill_batch.extend_seq_lens, decode_extend_batch.extend_seq_lens),
+    )
+    if (
+        prefill_batch.extend_prefix_lens is None
+        or decode_extend_batch.extend_prefix_lens is None
+    ):
+        raise ValueError("Draft composition children need extend_prefix_lens")
+    packed.extend_prefix_lens = scratch.pack(
+        "extend_prefix_lens",
+        (prefill_batch.extend_prefix_lens, decode_extend_batch.extend_prefix_lens),
+    )
+    packed.extend_start_loc = scratch.tensor(
+        "extend_start_loc",
+        (packed.batch_size,),
+        dtype=packed.extend_seq_lens.dtype,
+        device=packed.extend_seq_lens.device,
+    )
+    packed.extend_start_loc[0] = 0
+    torch.cumsum(
+        packed.extend_seq_lens[:-1], dim=0, out=packed.extend_start_loc[1:]
+    )
+    packed.orig_seq_lens = scratch.pack(
+        "orig_seq_lens",
+        (
+            (
+                prefill_batch.orig_seq_lens
+                if prefill_batch.orig_seq_lens is not None
+                else prefill_batch.seq_lens
+            ),
+            (
+                decode_extend_batch.orig_seq_lens
+                if decode_extend_batch.orig_seq_lens is not None
+                else decode_extend_batch.seq_lens
+            ),
+        ),
+    )
+    decode_requests = decode_extend_batch.batch_size
+    if decode_tokens % decode_requests != 0:
+        raise ValueError("Draft decode-extend tokens require a fixed request width")
+    decode_width = decode_tokens // decode_requests
+    packed.extend_seq_lens_cpu = (
+        [
+            *prefill_batch.extend_seq_lens_cpu,
+            *([decode_width] * decode_requests),
+        ]
+        if prefill_batch.extend_seq_lens_cpu is not None
+        else None
+    )
+    if prefill_batch.extend_prefix_lens_cpu is not None:
+        decode_seq_lens_cpu = decode_extend_batch.seq_lens_cpu
+        packed.extend_prefix_lens_cpu = [
+            *prefill_batch.extend_prefix_lens_cpu,
+            *(
+                (decode_seq_lens_cpu - decode_width).tolist()
+                if decode_seq_lens_cpu is not None
+                else [1] * decode_requests
+            ),
+        ]
+    else:
+        packed.extend_prefix_lens_cpu = None
+    packed.extend_logprob_start_lens_cpu = None
+    total_tokens = prefill_tokens + decode_tokens
+    packed.extend_num_tokens = total_tokens
+    packed.num_token_non_padded_cpu = total_tokens
+    packed.capture_hidden_mode = (
+        CaptureHiddenMode.NULL
+        if prefill_batch.capture_hidden_mode == CaptureHiddenMode.NULL
+        else CaptureHiddenMode.LAST
+    )
+    packed.return_logprob = False
+    packed_hidden = scratch.pack(
+        "draft_hidden_states",
+        (prefill_spec.hidden_states, decode_spec.hidden_states),
+    )
+    packed.spec_info = copy.copy(prefill_spec)
+    packed.spec_info.hidden_states = packed_hidden
+    packed.spec_info.select_index = None
+    packed.composition = composition
+    gather_out = scratch.tensor(
+        "logits_gather_indices",
+        (packed.batch_size,),
+        dtype=torch.int64,
+        device=packed.input_ids.device,
+    )
+    composition.build_logits_gather_indices(out=gather_out)
+    packed._attn_output = None
     packed.can_run_dp_cuda_graph = True
     packed.can_run_dp_breakable_cuda_graph = True
     return packed

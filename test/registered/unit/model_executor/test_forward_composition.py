@@ -1,14 +1,17 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from sglang.srt.layers.attention.flashattention_backend import (
     CompositePrefillVerifyFlashAttentionMetadata,
     FlashAttentionBackend,
+    FusedForwardCompositionFlashAttentionMetadata,
 )
 from sglang.srt.layers.attention.triton_backend import (
     CompositeForwardMetadataScratch,
     CompositePrefillVerifyMetadata,
+    FusedForwardCompositionMetadata,
     TritonAttnBackend,
 )
 from sglang.srt.layers.logits_processor import (
@@ -16,12 +19,16 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
     split_composition_logits_output,
+    split_draft_extend_composition_output,
 )
 from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    DraftExtendComposition,
     ForwardBatch,
     ForwardComposition,
     ForwardCompositionTensorScratch,
     ForwardMode,
+    pack_draft_prefill_and_decode_extend_forward,
     pack_prefill_and_verify_forward,
 )
 from sglang.srt.speculative.parity import (
@@ -180,8 +187,9 @@ def test_pack_and_split_composition_use_stable_segment_views():
     assert packed.out_cache_loc.tolist() == [0, 1, 2, 0, 1, 2, 3]
     assert packed.extend_seq_lens.tolist() == [2, 1, 2, 2]
     assert packed.extend_seq_lens_cpu == [2, 1, 2, 2]
-    assert packed.extend_prefix_lens.tolist() == [8, 19, 30, 40]
-    assert packed.extend_prefix_lens_cpu == [8, 19, 30, 40]
+    assert packed.seq_lens.tolist() == [3, 3, 34, 44]
+    assert packed.extend_prefix_lens.tolist() == [8, 19, 32, 42]
+    assert packed.extend_prefix_lens_cpu == [8, 19, 32, 42]
     assert packed.extend_start_loc.tolist() == [0, 2, 3, 5]
     assert packed.orig_seq_lens.tolist() == [10, 20, 30, 40]
     assert packed.extend_seq_lens.data_ptr() != prefill.extend_seq_lens.data_ptr()
@@ -246,6 +254,25 @@ def test_composition_metadata_uses_disjoint_views_of_shared_arenas():
     assert verify.kv_indices.numel() == 4
 
 
+def test_target_pack_preserves_fa3_ragged_host_metadata_for_gpu_only_verify():
+    prefill = _batch(ForwardMode.EXTEND, num_tokens=2, batch_size=1)
+    prefill.extend_seq_lens = torch.tensor([2], dtype=torch.int32)
+    prefill.extend_seq_lens_cpu = [2]
+    prefill.extend_prefix_lens = torch.tensor([0], dtype=torch.int64)
+    prefill.extend_prefix_lens_cpu = [0]
+    prefill.positions = torch.tensor([0, 1], dtype=torch.int64)
+    verify = _batch(ForwardMode.TARGET_VERIFY, num_tokens=4, batch_size=2)
+    verify.seq_lens = torch.tensor([12, 22], dtype=torch.int64)
+    verify.seq_lens_cpu = None
+    verify.positions = torch.tensor([10, 11, 20, 21], dtype=torch.int64)
+
+    packed = pack_prefill_and_verify_forward(prefill, verify)
+
+    assert packed.seq_lens.tolist() == [2, 14, 24]
+    assert packed.extend_seq_lens_cpu == [2, 2, 2]
+    assert packed.extend_prefix_lens_cpu == [0, 1, 1]
+
+
 def test_composition_kv_indices_arena_grows_and_then_reuses_storage():
     scratch = CompositeForwardMetadataScratch(
         int32_indptr=torch.zeros((2, 5), dtype=torch.int32),
@@ -294,6 +321,100 @@ def test_pack_reuses_persistent_buffers_and_precomputes_logits_gather():
     )
 
 
+def test_pack_draft_composition_builds_full_token_parent_and_selected_rows():
+    prefill = _batch(ForwardMode.EXTEND, num_tokens=3, batch_size=2)
+    prefill.seq_lens = torch.tensor([10, 20], dtype=torch.int64)
+    prefill.seq_lens_cpu = prefill.seq_lens.clone()
+    prefill.seq_lens_sum = 30
+    prefill.extend_seq_lens = torch.tensor([2, 1], dtype=torch.int32)
+    prefill.extend_seq_lens_cpu = [2, 1]
+    prefill.extend_prefix_lens = torch.tensor([8, 19], dtype=torch.int64)
+    prefill.extend_prefix_lens_cpu = [8, 19]
+    prefill.positions = torch.tensor([8, 9, 19], dtype=torch.int64)
+    prefill.capture_hidden_mode = CaptureHiddenMode.LAST
+    prefill.spec_info = SimpleNamespace(hidden_states=torch.randn(3, 8))
+
+    decode = _batch(ForwardMode.DRAFT_EXTEND_V2, num_tokens=4, batch_size=2)
+    decode.req_pool_indices = torch.tensor([2, 3], dtype=torch.int64)
+    decode.seq_lens = torch.tensor([12, 22], dtype=torch.int64)
+    decode.seq_lens_cpu = None
+    decode.seq_lens_sum = 34
+    decode.extend_seq_lens = torch.tensor([2, 2], dtype=torch.int32)
+    decode.extend_seq_lens_cpu = None
+    decode.extend_prefix_lens = torch.tensor([10, 20], dtype=torch.int64)
+    decode.extend_prefix_lens_cpu = None
+    decode.positions = torch.tensor([10, 11, 20, 21], dtype=torch.int64)
+    decode.capture_hidden_mode = CaptureHiddenMode.FULL
+    decode.spec_info = SimpleNamespace(hidden_states=torch.randn(4, 8))
+    select_index = torch.tensor([0, 3], dtype=torch.int64)
+
+    packed = pack_draft_prefill_and_decode_extend_forward(
+        prefill, decode, select_index
+    )
+
+    assert packed.forward_mode == ForwardMode.MIXED
+    assert isinstance(packed.composition, DraftExtendComposition)
+    assert packed.input_ids.shape == (7,)
+    assert packed.spec_info.hidden_states.shape == (7, 8)
+    assert packed.extend_seq_lens.tolist() == [2, 1, 2, 2]
+    assert packed.extend_prefix_lens.tolist() == [8, 19, 10, 20]
+    assert packed.extend_seq_lens_cpu == [2, 1, 2, 2]
+    assert packed.extend_prefix_lens_cpu == [8, 19, 1, 1]
+    assert packed.composition.logits_gather_indices.tolist() == [1, 2, 3, 6]
+    assert packed.capture_hidden_mode == CaptureHiddenMode.LAST
+
+    logits = torch.randn(4, 16)
+    hidden = torch.randn(4, 8)
+    prefill_output, decode_output = split_draft_extend_composition_output(
+        LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden),
+        prefill_requests=2,
+        decode_requests=2,
+    )
+    assert prefill_output.next_token_logits.data_ptr() == logits[:2].data_ptr()
+    assert decode_output.next_token_logits.data_ptr() == logits[2:].data_ptr()
+    assert decode_output.hidden_states.data_ptr() == hidden[2:].data_ptr()
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda value: setattr(value, "kind", "unknown"), "Unsupported"),
+        (
+            lambda value: setattr(
+                value.prefill_batch, "forward_mode", ForwardMode.DECODE
+            ),
+            "EXTEND",
+        ),
+        (
+            lambda value: setattr(
+                value.decode_extend_batch, "forward_mode", ForwardMode.EXTEND
+            ),
+            "DRAFT_EXTEND_V2",
+        ),
+        (lambda value: setattr(value, "decode_extend_num_tokens", 3), "do not match"),
+        (
+            lambda value: setattr(value, "decode_select_index", torch.tensor([0])),
+            "one row per request",
+        ),
+    ],
+)
+def test_draft_composition_rejects_invalid_role_layout(mutate, message):
+    composition = DraftExtendComposition(
+        kind="draft_prefill_decode_extend",
+        prefill_batch=_batch(ForwardMode.EXTEND, num_tokens=3, batch_size=2),
+        decode_extend_batch=_batch(
+            ForwardMode.DRAFT_EXTEND_V2, num_tokens=4, batch_size=2
+        ),
+        prefill_num_tokens=3,
+        decode_extend_num_tokens=4,
+        decode_select_index=torch.tensor([0, 3]),
+    )
+    mutate(composition)
+
+    with pytest.raises(ValueError, match=message):
+        composition.validate(parent_num_tokens=7)
+
+
 def _bare_triton_backend() -> TritonAttnBackend:
     backend = TritonAttnBackend.__new__(TritonAttnBackend)
     backend.dcp_size = 1
@@ -330,6 +451,86 @@ def test_fa3_composition_capability_accepts_p0_shape():
     assert backend.supports_forward_composition(
         "prefill_spec_verify", topk=1, fixed_q_len=2
     )
+
+
+@pytest.mark.parametrize("factory", [_bare_triton_backend, _bare_fa3_backend])
+def test_draft_fused_composition_requires_draft_runner(factory):
+    backend = factory()
+    backend.is_draft_runner = True
+    assert backend.supports_fused_forward_composition(
+        "draft_prefill_decode_extend", topk=1, fixed_q_len=2
+    )
+    assert not backend.supports_fused_forward_composition(
+        "prefill_spec_verify", topk=1, fixed_q_len=2
+    )
+
+
+@pytest.mark.parametrize(
+    ("factory", "metadata_type"),
+    [
+        (_bare_triton_backend, FusedForwardCompositionMetadata),
+        (_bare_fa3_backend, FusedForwardCompositionFlashAttentionMetadata),
+    ],
+)
+def test_fused_composition_invokes_backend_once_for_all_tokens(
+    factory, metadata_type
+):
+    backend = factory()
+    composition = _composition()
+    batch = _batch(ForwardMode.MIXED, num_tokens=7, batch_size=3)
+    batch.composition = composition
+    backend.forward_composition_metadata = metadata_type(
+        forward=object(),
+        prefill_num_tokens=3,
+        verify_num_tokens=4,
+    )
+    expected = torch.randn(7, 4)
+    backend.forward_extend = Mock(return_value=expected)
+    q = torch.randn(7, 4)
+    k = torch.randn(7, 4)
+    v = torch.randn(7, 4)
+
+    actual = backend._forward_extend_composition(
+        q, k, v, object(), batch, save_kv_cache=True
+    )
+
+    assert actual is expected
+    backend.forward_extend.assert_called_once()
+    assert backend.forward_extend.call_args.args[0] is q
+    assert backend.forward_extend.call_args.args[1] is k
+    assert backend.forward_extend.call_args.args[2] is v
+    assert backend.forward_extend.call_args.args[4] is batch
+    assert batch.composition is composition
+
+
+@pytest.mark.parametrize(
+    ("factory", "metadata_type"),
+    [
+        (_bare_triton_backend, FusedForwardCompositionMetadata),
+        (_bare_fa3_backend, FusedForwardCompositionFlashAttentionMetadata),
+    ],
+)
+def test_fused_composition_restores_parent_after_backend_error(
+    factory, metadata_type
+):
+    backend = factory()
+    composition = _composition()
+    batch = _batch(ForwardMode.MIXED, num_tokens=7, batch_size=3)
+    batch.composition = composition
+    backend.forward_composition_metadata = metadata_type(
+        forward=object(),
+        prefill_num_tokens=3,
+        verify_num_tokens=4,
+    )
+    backend.forward_extend = Mock(side_effect=RuntimeError("attention failed"))
+    q = torch.randn(7, 4)
+
+    with pytest.raises(RuntimeError, match="attention failed"):
+        backend._forward_extend_composition(
+            q, q, q, object(), batch, save_kv_cache=True
+        )
+
+    assert batch.composition is composition
 
 
 @pytest.mark.parametrize(

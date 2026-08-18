@@ -1080,6 +1080,9 @@ class Envs:
     # speculative mixed prefill+verify.  This is narrower than full
     # deterministic inference: attention and sampling keep their normal paths.
     SGLANG_SPEC_MIXED_BATCH_INVARIANT = EnvBool(False)
+    # Experimental true mixed composition: target/draft attention receives the
+    # complete packed token axis in one backend invocation per layer.
+    SGLANG_ENABLE_SPEC_MIXED_FUSED_ATTENTION = EnvBool(False)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
     # Set to 1: force enable (even without --enable-deterministic-inference)

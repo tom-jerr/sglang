@@ -184,6 +184,42 @@ def split_composition_logits_output(
     )
 
 
+def split_draft_extend_composition_output(
+    packed: LogitsProcessorOutput,
+    *,
+    prefill_requests: int,
+    decode_requests: int,
+) -> tuple[LogitsProcessorOutput, LogitsProcessorOutput]:
+    """Split selected draft composition rows without copying tensors."""
+    expected = prefill_requests + decode_requests
+    logits = packed.next_token_logits
+    if logits is None or logits.shape[0] != expected:
+        raise ValueError("Packed draft composition logits have an unexpected row count")
+    hidden_states = packed.hidden_states
+    if hidden_states is not None and hidden_states.shape[0] != expected:
+        raise ValueError("Packed draft composition hidden states have an unexpected row count")
+    return (
+        dataclasses.replace(
+            packed,
+            next_token_logits=logits[:prefill_requests],
+            hidden_states=(
+                hidden_states[:prefill_requests]
+                if hidden_states is not None
+                else None
+            ),
+        ),
+        dataclasses.replace(
+            packed,
+            next_token_logits=logits[prefill_requests:],
+            hidden_states=(
+                hidden_states[prefill_requests:]
+                if hidden_states is not None
+                else None
+            ),
+        ),
+    )
+
+
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode

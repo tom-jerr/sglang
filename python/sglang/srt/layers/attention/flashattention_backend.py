@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
 import torch
@@ -126,6 +126,13 @@ class CompositePrefillVerifyFlashAttentionMetadata:
     verify_num_tokens: int
 
 
+@dataclass
+class FusedForwardCompositionFlashAttentionMetadata:
+    forward: FlashAttentionMetadata
+    prefill_num_tokens: int
+    verify_num_tokens: int
+
+
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
 
@@ -170,7 +177,10 @@ class FlashAttentionBackend(AttentionBackend):
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.forward_metadata: FlashAttentionMetadata = None
         self.forward_composition_metadata: Optional[
-            CompositePrefillVerifyFlashAttentionMetadata
+            Union[
+                CompositePrefillVerifyFlashAttentionMetadata,
+                FusedForwardCompositionFlashAttentionMetadata,
+            ]
         ] = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
@@ -380,7 +390,16 @@ class FlashAttentionBackend(AttentionBackend):
         """
         return (
             self.fa_impl_ver == 3
-            and kind == "prefill_spec_verify"
+            and (
+                (
+                    kind == "prefill_spec_verify"
+                    and not getattr(self, "is_draft_runner", False)
+                )
+                or (
+                    kind == "draft_prefill_decode_extend"
+                    and getattr(self, "is_draft_runner", False)
+                )
+            )
             and topk == 1
             and fixed_q_len > 0
             and self.attn_cp_size == 1
@@ -389,6 +408,13 @@ class FlashAttentionBackend(AttentionBackend):
             and not self.has_swa
             and not self.is_encoder_decoder
             and not self.fa_skip_kv_cache
+        )
+
+    def supports_fused_forward_composition(
+        self, kind: str, *, topk: int, fixed_q_len: int
+    ) -> bool:
+        return self.supports_forward_composition(
+            kind, topk=topk, fixed_q_len=fixed_q_len
         )
 
     def _compute_scheduler_metadata(
@@ -719,7 +745,8 @@ class FlashAttentionBackend(AttentionBackend):
             fixed_q_len=fixed_q_len,
         ):
             raise NotImplementedError(
-                "FA3 forward composition requires MHA, topk=1, fixed verify "
+                "FA3 forward composition requires a supported target/draft role, "
+                "MHA, topk=1, fixed second-segment "
                 "width, CP=1, and no SWA/local/cross attention"
             )
         if fixed_q_len != self.speculative_num_draft_tokens:
@@ -727,6 +754,26 @@ class FlashAttentionBackend(AttentionBackend):
                 "FA3 composition verify width does not match the configured "
                 "speculative token count"
             )
+
+        if composition.fused_attention:
+            if not self.supports_fused_forward_composition(
+                composition.kind,
+                topk=self.topk,
+                fixed_q_len=fixed_q_len,
+            ):
+                raise NotImplementedError(
+                    "FA3 cannot fuse this forward composition into one attention call"
+                )
+            fused_metadata = self._build_forward_metadata(forward_batch)
+            self.forward_composition_metadata = (
+                FusedForwardCompositionFlashAttentionMetadata(
+                    forward=fused_metadata,
+                    prefill_num_tokens=composition.prefill_num_tokens,
+                    verify_num_tokens=composition.verify_num_tokens,
+                )
+            )
+            self.forward_metadata = fused_metadata
+            return
 
         prefill_metadata = self._build_forward_metadata(composition.prefill_batch)
         verify_metadata = self._build_forward_metadata(composition.verify_batch)
@@ -1891,13 +1938,7 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias=None,
         rel_bias_event=None,
     ) -> torch.Tensor:
-        """Execute a packed prefill/verify as two native FA3 extend calls.
-
-        Q/K/V and the output remain views of their packed storage.  Splitting at
-        the attention boundary is required because FA3 accepts one page-table /
-        query-layout plan per invocation, while prefill and tree verify use
-        different causal geometries.
-        """
+        """Execute a packed composition using fused or segmented FA3 metadata."""
         composition = forward_batch.composition
         metadata = self.forward_composition_metadata
         if composition is None or metadata is None:
@@ -1913,6 +1954,32 @@ class FlashAttentionBackend(AttentionBackend):
                 "FA3 forward composition does not support score_mod, auxiliary "
                 "tensors, or relative bias"
             )
+
+        if isinstance(metadata, FusedForwardCompositionFlashAttentionMetadata):
+            saved_composition = forward_batch.composition
+            forward_batch.composition = None
+            try:
+                return self.forward_extend(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    q_rope=q_rope,
+                    k_rope=k_rope,
+                    sinks=sinks,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    score_mod=score_mod,
+                    aux_tensors=aux_tensors,
+                    rel_bias=rel_bias,
+                    rel_bias_event=rel_bias_event,
+                    forward_metadata=metadata.forward,
+                )
+            finally:
+                forward_batch.composition = saved_composition
 
         prefill_end = metadata.prefill_num_tokens
         total_tokens = q.shape[0]

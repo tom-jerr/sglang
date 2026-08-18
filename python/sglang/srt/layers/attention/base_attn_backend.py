@@ -131,6 +131,12 @@ class AttentionBackend(ABC):
         """Whether this backend can execute a heterogeneous packed forward."""
         return False
 
+    def supports_fused_forward_composition(
+        self, kind: str, *, topk: int, fixed_q_len: int
+    ) -> bool:
+        """Whether one attention invocation can consume all packed tokens."""
+        return False
+
     def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
         """Declare where this backend's scheduler-shared reads end per mode.
 
