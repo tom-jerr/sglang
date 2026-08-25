@@ -542,10 +542,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(
-        self, size, stream_idx=None, variant_label=None, dsa_variant=None
+        self,
+        size,
+        stream_idx=None,
+        variant_label=None,
+        dsa_variant=None,
+        request_capacity=None,
     ):
         return ShapeKey(
             size=size,
+            request_capacity=request_capacity,
             stream_idx=stream_idx,
             variant_label=variant_label,
             dsa_variant=dsa_variant,
@@ -1216,6 +1222,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                     dsa_variant,
+                    request_capacity=(bs if self.ragged_verify_mode else None),
                 )
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
@@ -1287,7 +1294,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             dsa_variant = self._resolve_dsa_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label, dsa_variant
+                graph_size_key,
+                stream_idx,
+                variant_label,
+                dsa_variant,
+                request_capacity=(
+                    self._ragged_capture_slots(graph_size_key) if is_ragged else None
+                ),
             )
             return
 
@@ -1380,7 +1393,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variant = self._resolve_dsa_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label, dsa_variant
+            graph_size_key,
+            stream_idx,
+            variant_label,
+            dsa_variant,
+            request_capacity=(bs if is_ragged else None),
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
@@ -1410,7 +1427,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.forward_mode.name,
                     forward_batch.batch_size,
                     (
-                        f" slots={self._ragged_capture_slots(self._replay_graph_key.size)}"
+                        f" slots={self._replay_graph_key.request_capacity}"
                         if self.ragged_verify_mode
                         else ""
                     ),

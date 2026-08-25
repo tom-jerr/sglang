@@ -1065,14 +1065,18 @@ class HybridLinearAttnBackend(AttentionBackend):
             attn_backend.init_forward_metadata(forward_batch)
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
-        self, forward_batch: ForwardBatch
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        request_capacity: Optional[int] = None,
     ):
         captured = []
         for backend in self.attn_backend_list:
             if backend.use_captured_forward_metadata_for_breakable_cuda_graph:
                 captured.append(
                     backend.init_forward_metadata_for_breakable_cuda_graph_capture(
-                        forward_batch
+                        forward_batch,
+                        request_capacity=request_capacity,
                     )
                 )
             else:

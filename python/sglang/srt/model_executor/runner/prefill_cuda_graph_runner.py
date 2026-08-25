@@ -89,7 +89,11 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
 )
-from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner.shape_key import (
+    GraphShape,
+    GraphShapePlanner,
+    ShapeKey,
+)
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -279,6 +283,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
         self.max_bs = model_runner.req_to_token_pool.size
+        self.capture_shape_planner: Optional[GraphShapePlanner] = None
+        self._replay_graph_shape: Optional[GraphShape] = None
 
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
@@ -473,6 +479,58 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
 
+        if self.prefill_backend_name == Backend.BREAKABLE:
+            configured_shapes = prefill_config.shape_buckets
+            if configured_shapes is None:
+                # Preserve the former implicit capacity exactly: every token
+                # bucket could replay any request count up to the pool (and at
+                # most one request per packed token).
+                graph_shapes = [
+                    GraphShape(
+                        token_capacity=num_tokens,
+                        request_capacity=min(self.max_bs, num_tokens),
+                    )
+                    for num_tokens in self.capture_num_tokens
+                ]
+            else:
+                allowed_tokens = set(self.capture_num_tokens)
+                graph_shapes = [
+                    GraphShape(
+                        token_capacity=int(token_capacity),
+                        request_capacity=int(request_capacity),
+                    )
+                    for token_capacity, request_capacity in configured_shapes
+                    if int(token_capacity) in allowed_tokens
+                ]
+            context_length = (
+                self.model_runner.model_config.context_len or self.max_num_tokens
+            )
+            for shape in graph_shapes:
+                min_requests = _ceil_div(shape.token_capacity, context_length)
+                if shape.request_capacity < min_requests:
+                    raise ValueError(
+                        "Prefill CUDA graph shape cannot represent its token "
+                        f"capacity within context_length={context_length}: "
+                        f"{shape}; need request_capacity >= {min_requests}."
+                    )
+                if shape.request_capacity > self.max_bs:
+                    raise ValueError(
+                        f"Prefill CUDA graph {shape} exceeds request-pool "
+                        f"capacity {self.max_bs}."
+                    )
+            self.capture_shape_planner = GraphShapePlanner(
+                graph_shapes,
+                max_token_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+            )
+            self.capture_num_tokens = list(self.capture_shape_planner.token_capacities)
+            logger.info(
+                "Breakable prefill CUDA graph shapes (tokens, requests): %s",
+                [
+                    (shape.token_capacity, shape.request_capacity)
+                    for shape in self.capture_shape_planner.shapes
+                ],
+            )
+
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
         # Draft consumes aux-concatenated hidden states from the target
@@ -501,7 +559,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             self.use_captured_attn_metadata = False
-        self.attn_metadata_buffers: Optional[Dict[int, object]] = (
+        self.attn_metadata_buffers: Optional[Dict[ShapeKey, object]] = (
             {} if self.use_captured_attn_metadata else None
         )
 
@@ -835,13 +893,39 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         real_n = _ceil_div(max_prefix_len, self._prefix_chunk_len)
         return next((n for n in self._prefix_capture_variants if n >= real_n), None)
 
-    def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
+    def _shape_key(
+        self,
+        num_tokens: int,
+        forward_batch: ForwardBatch,
+        *,
+        request_capacity: Optional[int] = None,
+    ) -> ShapeKey:
         variant = None
         if self._capture_chunked_prefix and self._has_prefix_hit(forward_batch):
             captured_n = self._select_prefix_capture_chunks(forward_batch)
             assert captured_n is not None, "prefix batch has no captured FullCG variant"
             variant = _chunked_prefix_variant(captured_n)
-        return ShapeKey(size=num_tokens, variant_label=variant)
+        return ShapeKey(
+            size=num_tokens,
+            request_capacity=request_capacity,
+            variant_label=variant,
+        )
+
+    def _select_graph_shape(
+        self,
+        *,
+        num_tokens: int,
+        batch_size: int,
+        token_capacity: Optional[int] = None,
+    ) -> Optional[GraphShape]:
+        planner = getattr(self, "capture_shape_planner", None)
+        if planner is None:
+            return None
+        return planner.select(
+            num_tokens=num_tokens,
+            num_requests=batch_size,
+            token_capacity=token_capacity,
+        )
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
         """Allocate the stable chunk-metadata tensors shared by all variants."""
@@ -977,7 +1061,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _init_forward_metadata_for_capture(
-        self, forward_batch: ForwardBatch, num_tokens: int
+        self, forward_batch: ForwardBatch, shape_key: ShapeKey
     ) -> None:
         """Capture-time metadata init for the BCG-with-captured-metadata
         contract. For opt-in backends (DSV4), call the BCG-specific entry
@@ -988,16 +1072,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata(forward_batch)
             return
         metadata = attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
-            forward_batch
+            forward_batch,
+            request_capacity=shape_key.request_capacity,
         )
         assert self.attn_metadata_buffers is not None
-        self.attn_metadata_buffers[num_tokens] = metadata
+        self.attn_metadata_buffers[shape_key] = metadata
 
     def _prepare_forward_metadata_for_replay(
         self,
         forward_batch: ForwardBatch,
         static_forward_batch: ForwardBatch,
-        num_tokens: int,
+        shape_key: ShapeKey,
     ) -> None:
         """Replay-time metadata refresh for the BCG-with-captured-metadata
         contract. For opt-in backends, refresh the stashed per-bucket
@@ -1029,7 +1114,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata(forward_batch)
             return
         assert self.attn_metadata_buffers is not None
-        metadata = self.attn_metadata_buffers[num_tokens]
+        metadata = self.attn_metadata_buffers[shape_key]
         attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             metadata,
             forward_batch,
@@ -1103,6 +1188,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return True
         if num_tokens > self.max_num_tokens:
             return False
+        if getattr(self, "capture_shape_planner", None) is not None:
+            return (
+                self._select_graph_shape(
+                    num_tokens=num_tokens,
+                    batch_size=batch_size,
+                )
+                is not None
+            )
         # No exact-shape check: load_batch bucket-pads; only reject
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
@@ -1125,7 +1218,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         if (
-            isinstance(self.backend, BreakableCudaGraphBackend)
+            isinstance(getattr(self, "backend", None), BreakableCudaGraphBackend)
             and self.use_captured_attn_metadata
             and not self.model_runner.attn_backend.can_replay_captured_attention_body(
                 forward_batch
@@ -1161,12 +1254,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch
         ):
             assert self.prefill_cp_bcg_input is not None
-            if (
+            cp_token_capacity = (
                 self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
                     num_tokens=len(forward_batch.input_ids),
                     extend_seq_lens=forward_batch.extend_seq_lens_cpu,
                     capture_num_tokens=self.capture_num_tokens,
                     max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+                )
+            )
+            if cp_token_capacity is None:
+                return False
+            if (
+                getattr(self, "capture_shape_planner", None) is not None
+                and self._select_graph_shape(
+                    num_tokens=len(forward_batch.input_ids),
+                    batch_size=forward_batch.batch_size,
+                    token_capacity=cp_token_capacity,
                 )
                 is None
             ):
@@ -1186,7 +1289,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_states=self.static_draft_hidden_states[:num_tokens],
         )
 
-    def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
+    def capture_prepare(
+        self, num_tokens: int, *, request_capacity: Optional[int] = None
+    ) -> tuple[ForwardBatch, AttentionBackend]:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
         Default tensor inputs are fresh literals; under a Breakable
@@ -1209,6 +1314,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # zero-length sentinels after the context-bounded real requests.
             capture_seq_lens += [0] * (self._capture_req_slots - len(capture_seq_lens))
         bs = len(capture_seq_lens)
+        if request_capacity is not None:
+            assert bs <= request_capacity, (
+                f"Capture layout needs {bs} requests for {num_tokens} tokens, "
+                f"but graph request capacity is {request_capacity}."
+            )
         assert bs <= self.max_bs, (
             f"Capture batch needs {bs} request slots for {num_tokens} tokens, "
             f"but the request pool has only {self.max_bs}."
@@ -1348,12 +1458,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.gpu_id,
             empty_cache=False,
         )
-        capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-            if get_parallel().tp_rank == 0
-            else reversed(self.capture_num_tokens)
+        capture_shapes = (
+            list(self.capture_shape_planner.shapes)
+            if self.capture_shape_planner is not None
+            else [GraphShape(num_tokens, 1) for num_tokens in self.capture_num_tokens]
         )
-        for num_tokens in capture_range:
+        capture_range = (
+            tqdm.tqdm(list(reversed(capture_shapes)))
+            if get_parallel().tp_rank == 0
+            else reversed(capture_shapes)
+        )
+        for graph_shape in capture_range:
+            num_tokens = graph_shape.token_capacity
+            request_capacity = (
+                graph_shape.request_capacity
+                if self.capture_shape_planner is not None
+                else None
+            )
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
@@ -1361,19 +1482,33 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     empty_cache=False,
                 )
                 capture_range.set_description(
-                    f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
+                    "Capturing prefill shape "
+                    f"(tokens={num_tokens} requests={request_capacity} "
+                    f"{avail_mem=:.2f} GB)"
                 )
-            self.capture_one_shape(num_tokens)
+            self.capture_one_shape(num_tokens, request_capacity=request_capacity)
             if self._capture_chunked_prefix:
                 for captured_n in self._prefix_capture_variants:
-                    self.capture_one_shape(num_tokens, prefix_num_chunks=captured_n)
+                    self.capture_one_shape(
+                        num_tokens,
+                        request_capacity=request_capacity,
+                        prefix_num_chunks=captured_n,
+                    )
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+    def capture_one_shape(
+        self,
+        size: int,
+        *,
+        request_capacity: Optional[int] = None,
+        prefix_num_chunks: int = 0,
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
         num_tokens = size
-        forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        forward_batch, attn_backend = self.capture_prepare(
+            num_tokens, request_capacity=request_capacity
+        )
         if self.enable_cp_v2_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
@@ -1394,6 +1529,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             lora_manager.prepare_lora_batch(forward_batch)
         shape_key = ShapeKey(
             size=num_tokens,
+            request_capacity=request_capacity,
             variant_label=(
                 _chunked_prefix_variant(prefix_num_chunks)
                 if prefix_num_chunks
@@ -1414,7 +1550,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # Reaching into a backend-specific metadata cache here would make
             # this path incompatible with the OSS FlashAttention backend.
         else:
-            self._init_forward_metadata_for_capture(forward_batch, num_tokens)
+            self._init_forward_metadata_for_capture(forward_batch, shape_key)
 
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
@@ -1451,7 +1587,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         the model code reads during replay.
         """
         num_tokens = len(forward_batch.input_ids)
-        static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        selected_shape = self._select_graph_shape(
+            num_tokens=num_tokens,
+            batch_size=forward_batch.batch_size,
+        )
+        static_num_tokens = (
+            selected_shape.token_capacity
+            if selected_shape is not None
+            else self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        )
         if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
             forward_batch
         ):
@@ -1468,6 +1612,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 raise RuntimeError(
                     "Prefill CUDA graph replay was admitted without a fitting bucket"
                 )
+            if self.capture_shape_planner is not None:
+                selected_shape = self._select_graph_shape(
+                    num_tokens=num_tokens,
+                    batch_size=forward_batch.batch_size,
+                    token_capacity=static_num_tokens,
+                )
+                if selected_shape is None:
+                    raise RuntimeError(
+                        "Prefill CUDA graph replay was admitted without a fitting "
+                        "request-capacity bucket"
+                    )
+        self._replay_graph_shape = selected_shape
         self.raw_num_tokens = num_tokens
 
         bs = forward_batch.batch_size
@@ -1657,8 +1813,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             metadata_forward_batch = static_forward_batch
 
+        metadata_shape_key = ShapeKey(
+            size=static_num_tokens,
+            request_capacity=(
+                selected_shape.request_capacity if selected_shape is not None else None
+            ),
+        )
         self._prepare_forward_metadata_for_replay(
-            metadata_forward_batch, static_forward_batch, static_num_tokens
+            metadata_forward_batch, static_forward_batch, metadata_shape_key
         )
 
         return static_forward_batch
@@ -1793,7 +1955,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
-            shape_key = self._shape_key(static_num_tokens, forward_batch)
+            shape_key = self._shape_key(
+                static_num_tokens,
+                forward_batch,
+                request_capacity=(
+                    self._replay_graph_shape.request_capacity
+                    if self._replay_graph_shape is not None
+                    else None
+                ),
+            )
             # The only variants this runner records are chunked-prefix ones.
             if shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)

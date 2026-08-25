@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import torch
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
+    _build_gdn_bcg_chunk_offsets,
     _build_gdn_bcg_chunk_plan,
     _gdn_bcg_chunk_plan_capacity,
 )
@@ -42,6 +43,12 @@ class TestGDNBreakableCapture(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "needs 3 rows"):
             _build_gdn_bcg_chunk_plan([65, 1], capacity=2, dummy_sequence=2)
 
+    def test_chunk_offsets_cover_real_and_dummy_requests(self):
+        offsets = _build_gdn_bcg_chunk_offsets(
+            [65, 63, 16], request_capacity=5
+        )
+        self.assertEqual(offsets.tolist(), [0, 2, 3, 4, 4, 4])
+
     def test_metadata_refresh_preserves_captured_tensor_addresses(self):
         """Replay preparation must update values without replacing graph inputs."""
         backend = object.__new__(GDNAttnBackend)
@@ -52,6 +59,7 @@ class TestGDNBreakableCapture(CustomTestCase):
             mamba_cache_indices=torch.empty(5, dtype=torch.int32),
             gdn_has_initial_states=torch.empty(5, dtype=torch.bool),
             gdn_chunk_indices=torch.empty(5, 2, dtype=torch.int32),
+            gdn_chunk_offsets=torch.empty(6, dtype=torch.int32),
             track_conv_indices=torch.empty(5, 3, dtype=torch.int64),
             conv_states_mask_indices=torch.empty(5, dtype=torch.int64),
             track_ssm_h_src=torch.empty(5, dtype=torch.int64),
@@ -69,6 +77,7 @@ class TestGDNBreakableCapture(CustomTestCase):
             metadata.mamba_cache_indices.data_ptr(),
             metadata.gdn_has_initial_states.data_ptr(),
             metadata.gdn_chunk_indices.data_ptr(),
+            metadata.gdn_chunk_offsets.data_ptr(),
         )
         batch = SimpleNamespace(
             extend_seq_lens_cpu=[32, 16],
@@ -91,6 +100,7 @@ class TestGDNBreakableCapture(CustomTestCase):
             metadata.gdn_chunk_indices.tolist(),
             [[0, 0], [1, 0], [4, 0], [4, 0], [4, 0]],
         )
+        self.assertEqual(metadata.gdn_chunk_offsets.tolist(), [0, 1, 2, 2, 2, 2])
         self.assertEqual(
             pointers,
             (
@@ -98,6 +108,7 @@ class TestGDNBreakableCapture(CustomTestCase):
                 metadata.mamba_cache_indices.data_ptr(),
                 metadata.gdn_has_initial_states.data_ptr(),
                 metadata.gdn_chunk_indices.data_ptr(),
+                metadata.gdn_chunk_offsets.data_ptr(),
             ),
         )
 
@@ -153,6 +164,30 @@ class TestGDNBreakableCapture(CustomTestCase):
         backend._populate_breakable_prefill_metadata = lambda metadata, batch: None
         metadata = backend.init_forward_metadata_for_breakable_cuda_graph_capture(batch)
         self.assertIsNotNone(metadata.gdn_chunk_indices)
+
+    def test_explicit_request_bucket_bounds_metadata_and_chunk_plan(self):
+        backend = object.__new__(GDNAttnBackend)
+        backend.bcg_radix_tracking_enabled = False
+        backend.bcg_tracking_capture_max_tokens = 1024
+        backend.req_to_token_pool = _ReqPool()
+        backend.device = torch.device("cpu")
+        backend.pad_slot_id = -1
+        backend.conv_states_shape = (1, 1, 3)
+        backend._populate_breakable_prefill_metadata = lambda metadata, batch: None
+        batch = SimpleNamespace(input_ids=torch.empty(160, dtype=torch.int32))
+
+        metadata = backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+            batch, request_capacity=3
+        )
+
+        # Three real request lanes plus one dedicated zero-length dummy lane.
+        self.assertEqual(metadata.gdn_bcg_request_capacity, 4)
+        self.assertEqual(metadata.query_start_loc.shape, (5,))
+        self.assertEqual(metadata.gdn_chunk_offsets.shape, (5,))
+        self.assertEqual(
+            metadata.gdn_chunk_indices.shape,
+            (_gdn_bcg_chunk_plan_capacity(160, 3), 2),
+        )
 
 
 if __name__ == "__main__":

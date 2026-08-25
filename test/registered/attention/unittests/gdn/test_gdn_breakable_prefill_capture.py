@@ -3,6 +3,7 @@ import unittest
 import torch
 from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.linear.gdn_backend import (
+    _build_gdn_bcg_chunk_offsets,
     _build_gdn_bcg_chunk_plan,
     _gdn_bcg_chunk_plan_capacity,
 )
@@ -94,10 +95,16 @@ class TestGDNBreakablePrefillCapture(CustomTestCase):
             self.num_tokens, self.request_capacity - 1
         )
         chunk_plan = _build_gdn_bcg_chunk_plan(
-            self.seq_lens,
+            [self.num_tokens],
             capacity=chunk_capacity,
             dummy_sequence=self.request_capacity - 1,
         ).to(self.device)
+        chunk_offsets = _build_gdn_bcg_chunk_offsets(
+            [self.num_tokens], request_capacity=self.request_capacity
+        ).to(self.device)
+        self.query_start_loc.copy_(
+            torch.tensor([0, 96, 96, 96, 96], device=self.device)
+        )
 
         def run(state):
             return chunk_gated_delta_rule(
@@ -111,10 +118,8 @@ class TestGDNBreakablePrefillCapture(CustomTestCase):
                 cu_seqlens=self.query_start_loc,
                 use_qk_l2norm_in_kernel=True,
                 chunk_indices=chunk_plan,
+                chunk_offsets=chunk_offsets,
             )[0]
-
-        eager_state = state_init.clone()
-        eager_output = run(eager_state)
 
         graph_state = state_init.clone()
         self._warmup(lambda: run(graph_state))
@@ -123,6 +128,25 @@ class TestGDNBreakablePrefillCapture(CustomTestCase):
         with torch.cuda.graph(graph):
             graph_output = run(graph_state)
 
+        # Replay a different two-request layout through the same captured
+        # tensor addresses. Both index and offset metadata must be refreshed.
+        self.query_start_loc.copy_(
+            torch.tensor([0, 65, 96, 96, 96], device=self.device)
+        )
+        chunk_plan.copy_(
+            _build_gdn_bcg_chunk_plan(
+                self.seq_lens,
+                capacity=chunk_capacity,
+                dummy_sequence=self.request_capacity - 1,
+            ).to(self.device)
+        )
+        chunk_offsets.copy_(
+            _build_gdn_bcg_chunk_offsets(
+                self.seq_lens, request_capacity=self.request_capacity
+            ).to(self.device)
+        )
+        eager_state = state_init.clone()
+        eager_output = run(eager_state)
         graph_state.copy_(state_init)
         graph.replay()
         torch.cuda.synchronize()

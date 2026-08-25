@@ -70,6 +70,7 @@ class ForwardMetadata:
     # so captured kernels never depend on a live Python ForwardBatch.
     gdn_has_initial_states: Optional[torch.Tensor] = None
     gdn_chunk_indices: Optional[torch.Tensor] = None
+    gdn_chunk_offsets: Optional[torch.Tensor] = None
     # Fixed-capacity radix-track masks for captured GDN prefill. A step is 0
     # for a live row and -1 for a padded/no-op row.
     gdn_track_conv_steps: Optional[torch.Tensor] = None

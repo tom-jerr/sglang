@@ -65,6 +65,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     Phase,
     default_cuda_graph_config,
+    normalize_graph_shape_buckets,
     parse_cuda_graph_config_arg,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -4811,6 +4812,17 @@ class ServerArgs:
                 )
                 self.cuda_graph_config.prefill.bs = aligned
                 self.cuda_graph_config.prefill.max_bs = aligned[-1]
+                shapes = self.cuda_graph_config.prefill.shape_buckets
+                if shapes is not None:
+                    self.cuda_graph_config.prefill.shape_buckets = (
+                        normalize_graph_shape_buckets(
+                            [
+                                [((tokens + 7) // 8) * 8, requests]
+                                for tokens, requests in shapes
+                            ],
+                            option_name="cuda_graph_config[prefill].shape_buckets",
+                        )
+                    )
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -4871,6 +4883,36 @@ class ServerArgs:
                 continue
             for key, value in phase_config.items():
                 _set(phase, key, value)
+
+        # A sparse two-dimensional table is the source of truth when present.
+        # Publish its token-axis projection through ``bs`` so existing
+        # scheduler and memory-sizing code keeps a coherent one-dimensional
+        # compatibility view.
+        if config.prefill.shape_buckets is not None:
+            if (Phase.PREFILL, "bs") in locked:
+                raise ValueError(
+                    "cuda_graph_config[prefill].shape_buckets cannot be combined "
+                    "with an explicit prefill bs list"
+                )
+            if (Phase.PREFILL, "max_bs") in locked:
+                raise ValueError(
+                    "cuda_graph_config[prefill].shape_buckets cannot be combined "
+                    "with an explicit prefill max_bs"
+                )
+            shapes = normalize_graph_shape_buckets(
+                config.prefill.shape_buckets,
+                option_name="cuda_graph_config[prefill].shape_buckets",
+            )
+            token_buckets = sorted({shape[0] for shape in shapes})
+            config.prefill.shape_buckets = shapes
+            config.prefill.bs = token_buckets
+            config.prefill.max_bs = token_buckets[-1]
+            locked.update(
+                {
+                    (Phase.PREFILL, "bs"),
+                    (Phase.PREFILL, "max_bs"),
+                }
+            )
 
         self._declare(
             "_parse_cuda_graph_config",
@@ -5100,6 +5142,15 @@ class ServerArgs:
                     f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
                     f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
                 )
+        prefill_config = self.cuda_graph_config.prefill
+        if (
+            prefill_config.shape_buckets is not None
+            and prefill_config.backend != Backend.BREAKABLE
+        ):
+            raise ValueError(
+                "cuda_graph_config[prefill].shape_buckets currently requires "
+                "backend='breakable'"
+            )
 
     def _handle_multi_item_scoring(self):
         """Setup and validate multi-item scoring constraints.

@@ -1463,8 +1463,12 @@ class DeepseekV4AttnBackend(
         return metadata
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
-        self, forward_batch: ForwardBatch
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        request_capacity: Optional[int] = None,
     ):
+        del request_capacity
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
@@ -2335,14 +2339,20 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
-        self, forward_batch: ForwardBatch
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        request_capacity: Optional[int] = None,
     ):
         ret = []
         for i in range(self.speculative_num_steps - 1):
             ret.append(
                 self.attn_backends[
                     i
-                ].init_forward_metadata_for_breakable_cuda_graph_capture(forward_batch)
+                ].init_forward_metadata_for_breakable_cuda_graph_capture(
+                    forward_batch,
+                    request_capacity=request_capacity,
+                )
             )
         return ret
 

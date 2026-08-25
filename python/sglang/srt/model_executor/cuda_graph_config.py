@@ -77,6 +77,7 @@ ALLOWED_KEYS_PER_PHASE = {
         "backend",
         "max_bs",
         "bs",
+        "shape_buckets",
         "tc_compiler",
         "full_prefill_max_req",
         "full_prefill_prefix_chunk_tokens",
@@ -91,6 +92,10 @@ class PhaseConfig:
     backend: str = Backend.DISABLED
     max_bs: Optional[int] = None
     bs: Optional[List[int]] = None
+    # Optional sparse (token_capacity, request_capacity) table.  Currently
+    # consumed by breakable prefill graphs; ``bs`` remains the compatible
+    # one-dimensional token-bucket view used by scheduler/legacy paths.
+    shape_buckets: Optional[List[List[int]]] = None
     # Only meaningful when backend == tc_piecewise; ignored otherwise.
     tc_compiler: str = "eager"
     # Only meaningful for the prefill phase with backend == full: max number of
@@ -242,6 +247,45 @@ def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
                 )
             result[phase][key] = value
     return result
+
+
+def normalize_graph_shape_buckets(
+    raw: Any, *, option_name: str = "shape_buckets"
+) -> List[List[int]]:
+    """Validate and canonicalize a sparse ``[tokens, requests]`` table."""
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise ValueError(
+            f"{option_name} must be a non-empty list of [tokens, requests]"
+        )
+
+    shapes = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(
+                f"{option_name}[{index}] must be [token_capacity, "
+                f"request_capacity], got {item!r}"
+            )
+        token_capacity, request_capacity = item
+        if (
+            isinstance(token_capacity, bool)
+            or isinstance(request_capacity, bool)
+            or not isinstance(token_capacity, int)
+            or not isinstance(request_capacity, int)
+        ):
+            raise ValueError(
+                f"{option_name}[{index}] capacities must be integers, got {item!r}"
+            )
+        if token_capacity <= 0 or request_capacity <= 0:
+            raise ValueError(
+                f"{option_name}[{index}] capacities must be positive, got {item!r}"
+            )
+        if request_capacity > token_capacity:
+            raise ValueError(
+                f"{option_name}[{index}] request capacity cannot exceed token "
+                f"capacity, got {item!r}"
+            )
+        shapes.add((token_capacity, request_capacity))
+    return [list(shape) for shape in sorted(shapes)]
 
 
 def explicit_keys_in(

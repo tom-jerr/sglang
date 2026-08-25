@@ -180,8 +180,10 @@ class AttentionBackend(ABC):
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,
         forward_batch: ForwardBatch,
+        *,
+        request_capacity: Optional[int] = None,
     ):
-        """Create forward metadata whose tensor addresses will be graph-captured."""
+        """Create stable metadata for one packed-token graph envelope."""
         raise NotImplementedError()
 
     def prepare_forward_metadata_for_breakable_cuda_graph_replay(

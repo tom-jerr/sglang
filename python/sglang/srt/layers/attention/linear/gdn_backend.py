@@ -79,6 +79,23 @@ def _build_gdn_bcg_chunk_plan(
     return torch.tensor(rows, dtype=torch.int32)
 
 
+def _build_gdn_bcg_chunk_offsets(
+    seq_lens: Sequence[int], *, request_capacity: int
+) -> torch.Tensor:
+    """Build fixed-size cumulative chunk offsets for captured FLA kernels."""
+    offsets = torch.zeros((request_capacity + 1,), dtype=torch.int32)
+    real_offsets = [
+        (int(seq_len) + FLA_CHUNK_SIZE - 1) // FLA_CHUNK_SIZE
+        for seq_len in seq_lens
+    ]
+    if real_offsets:
+        offsets[1 : len(real_offsets) + 1] = torch.tensor(
+            real_offsets, dtype=torch.int32
+        ).cumsum(0)
+        offsets[len(real_offsets) + 1 :] = offsets[len(real_offsets)]
+    return offsets
+
+
 if is_cuda():
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
         fused_mamba_state_scatter_with_mask,
@@ -552,6 +569,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             dummy_sequence=request_capacity - 1,
         )
         metadata.gdn_chunk_indices.copy_(chunk_plan)
+        chunk_offsets = _build_gdn_bcg_chunk_offsets(
+            seq_lens, request_capacity=request_capacity
+        )
+        metadata.gdn_chunk_offsets.copy_(chunk_offsets)
 
         # Keep radix tracking capture-stable too. Without this, every request
         # crossing the normal cache checkpoint makes the entire prefill graph
@@ -649,7 +670,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
-        self, forward_batch: ForwardBatch
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        request_capacity: Optional[int] = None,
     ) -> ForwardMetadata:
         token_capacity = int(forward_batch.input_ids.shape[0])
         if (
@@ -660,7 +684,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # retain the existing per-layer eager breaks for this bucket.
             self.init_forward_metadata(forward_batch)
             return self.forward_metadata
-        max_real_requests = min(self.req_to_token_pool.size, token_capacity)
+        max_real_requests = (
+            min(self.req_to_token_pool.size, token_capacity)
+            if request_capacity is None
+            else request_capacity
+        )
+        if not (
+            1 <= max_real_requests <= min(self.req_to_token_pool.size, token_capacity)
+        ):
+            raise ValueError(
+                "GDN BCG request capacity must be in [1, "
+                f"{min(self.req_to_token_pool.size, token_capacity)}], got "
+                f"{max_real_requests}"
+            )
         # An extra zero-length request gives padded chunk-plan rows a target
         # that can never alias a real state slot.
         request_capacity = max_real_requests + 1
@@ -680,6 +716,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ),
             gdn_chunk_indices=torch.empty(
                 (chunk_capacity, 2), dtype=torch.int32, device=self.device
+            ),
+            gdn_chunk_offsets=torch.empty(
+                (request_capacity + 1,), dtype=torch.int32, device=self.device
             ),
             track_conv_indices=torch.zeros(
                 (request_capacity, self.conv_states_shape[-1]),
@@ -1104,6 +1143,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
                 chunk_indices=forward_metadata.gdn_chunk_indices,
+                chunk_offsets=forward_metadata.gdn_chunk_offsets,
             )
 
             if is_npu() and last_recurrent_state is not None:
