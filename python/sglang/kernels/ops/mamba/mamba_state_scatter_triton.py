@@ -319,6 +319,160 @@ def fused_mamba_state_scatter_with_mask(
 
 
 @triton.jit
+def _gdn_prefill_conv_track_scatter_kernel(
+    src_ptr,
+    dst_ptr,
+    src_token_indices_ptr,
+    dst_indices_ptr,
+    steps_ptr,
+    src_channel_stride,
+    src_token_stride,
+    dst_req_stride,
+    dst_channel_stride,
+    dst_window_stride,
+    num_channels: tl.constexpr,
+    window_size: tl.constexpr,
+    dst_req_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_req = tl.program_id(0)
+    pid_block = tl.program_id(1)
+    if tl.load(steps_ptr + pid_req) < 0:
+        return
+
+    dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
+    if (dst_idx < 0) | (dst_idx >= dst_req_size):
+        return
+
+    offsets = pid_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = offsets < num_channels * window_size
+    channel = offsets // window_size
+    window = offsets % window_size
+    token = tl.load(
+        src_token_indices_ptr + pid_req * window_size + window,
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    values = tl.load(
+        src_ptr + channel * src_channel_stride + token * src_token_stride,
+        mask=valid,
+    )
+    tl.store(
+        dst_ptr
+        + dst_idx * dst_req_stride
+        + channel * dst_channel_stride
+        + window * dst_window_stride,
+        values,
+        mask=valid,
+    )
+
+
+def scatter_gdn_prefill_conv_states_with_mask(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    src_token_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    steps: torch.Tensor,
+) -> None:
+    """Track GDN pre-convolution windows without gathering padded rows."""
+    if dst.ndim != 3 or src.ndim != 2:
+        raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
+    if src_token_indices.shape != (steps.shape[0], dst.shape[2]):
+        raise ValueError(
+            f"Unexpected token-index shape: {src_token_indices.shape=} "
+            f"for {steps.shape[0]=}, window={dst.shape[2]}"
+        )
+    if dst_indices.shape != steps.shape:
+        raise ValueError(f"Index shape mismatch: {dst_indices.shape=} {steps.shape=}")
+    _require_entry_contiguous_dst(dst, 1, "scatter_gdn_prefill_conv_states_with_mask")
+    block_size = 256
+    grid = (steps.shape[0], triton.cdiv(dst.shape[1] * dst.shape[2], block_size))
+    _gdn_prefill_conv_track_scatter_kernel[grid](
+        src,
+        dst,
+        src_token_indices,
+        dst_indices,
+        steps,
+        src.stride(0),
+        src.stride(1),
+        dst.stride(0),
+        dst.stride(1),
+        dst.stride(2),
+        dst.shape[1],
+        dst.shape[2],
+        dst.shape[0],
+        block_size,
+    )
+
+
+@triton.jit
+def _gdn_prefill_state_track_scatter_kernel(
+    src_ptr,
+    dst_ptr,
+    src_indices_ptr,
+    dst_indices_ptr,
+    steps_ptr,
+    src_req_stride,
+    dst_req_stride,
+    elem_per_entry: tl.constexpr,
+    src_req_size,
+    dst_req_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_req = tl.program_id(0)
+    pid_block = tl.program_id(1)
+    if tl.load(steps_ptr + pid_req) < 0:
+        return
+    src_idx = tl.load(src_indices_ptr + pid_req).to(tl.int64)
+    dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
+    if (
+        (src_idx < 0)
+        | (src_idx >= src_req_size)
+        | (dst_idx < 0)
+        | (dst_idx >= dst_req_size)
+    ):
+        return
+    offsets = pid_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = offsets < elem_per_entry
+    values = tl.load(src_ptr + src_idx * src_req_stride + offsets, mask=valid)
+    tl.store(dst_ptr + dst_idx * dst_req_stride + offsets, values, mask=valid)
+
+
+def scatter_gdn_prefill_states_with_mask(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    steps: torch.Tensor,
+) -> None:
+    """Track GDN SSM rows without materializing a fixed-capacity gather."""
+    if dst.shape[1:] != src.shape[1:]:
+        raise ValueError(f"Trailing dims mismatch: {dst.shape=} {src.shape=}")
+    if src_indices.shape != steps.shape or dst_indices.shape != steps.shape:
+        raise ValueError(
+            f"Index shape mismatch: {src_indices.shape=} {dst_indices.shape=} {steps.shape=}"
+        )
+    _require_entry_contiguous_dst(dst, 1, "scatter_gdn_prefill_states_with_mask")
+    _require_entry_contiguous_dst(src, 1, "scatter_gdn_prefill_states_with_mask")
+    elem_per_entry = dst[0].numel()
+    block_size = 256
+    grid = (steps.shape[0], triton.cdiv(elem_per_entry, block_size))
+    _gdn_prefill_state_track_scatter_kernel[grid](
+        src,
+        dst,
+        src_indices,
+        dst_indices,
+        steps,
+        src.stride(0),
+        dst.stride(0),
+        elem_per_entry,
+        src.shape[0],
+        dst.shape[0],
+        block_size,
+    )
+
+
+@triton.jit
 def _fused_conv_window_scatter_with_mask_kernel(
     src_ptr,
     dst_ptr,

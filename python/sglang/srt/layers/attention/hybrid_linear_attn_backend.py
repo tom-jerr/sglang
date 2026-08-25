@@ -4,7 +4,6 @@ import logging
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
-
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
@@ -975,6 +974,27 @@ class HybridLinearAttnBackend(AttentionBackend):
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
     @property
+    def use_captured_forward_metadata_for_breakable_cuda_graph(self) -> bool:
+        return any(
+            backend.use_captured_forward_metadata_for_breakable_cuda_graph
+            for backend in self.attn_backend_list
+        )
+
+    def can_capture_attention_body(self, layer, forward_batch: ForwardBatch) -> bool:
+        if self._is_full_attn(layer):
+            return False
+        return self.linear_attn_backend.can_capture_attention_body(
+            layer, forward_batch
+        )
+
+    def can_replay_captured_attention_body(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        return self.linear_attn_backend.can_replay_captured_attention_body(
+            forward_batch
+        )
+
+    @property
     def data_type(self):
         # KV-cache dtype readers (e.g. the trtllm_mla fused-rope check) reach the
         # wrapper since split backends are wrapped once (#31439); the full-attn
@@ -1043,6 +1063,40 @@ class HybridLinearAttnBackend(AttentionBackend):
             return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
+
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self, forward_batch: ForwardBatch
+    ):
+        captured = []
+        for backend in self.attn_backend_list:
+            if backend.use_captured_forward_metadata_for_breakable_cuda_graph:
+                captured.append(
+                    backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+                        forward_batch
+                    )
+                )
+            else:
+                backend.init_forward_metadata(forward_batch)
+                captured.append(None)
+        return captured
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        assert len(capture_metadata) == len(self.attn_backend_list)
+        for backend, metadata in zip(self.attn_backend_list, capture_metadata):
+            if backend.use_captured_forward_metadata_for_breakable_cuda_graph:
+                backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+                    metadata,
+                    forward_batch,
+                    static_forward_batch=static_forward_batch,
+                )
+            else:
+                backend.init_forward_metadata(forward_batch)
 
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False

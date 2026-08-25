@@ -18,14 +18,15 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
-
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -138,7 +139,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             out_rows = self._output_rows(out, size)
             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
 
-        stored = self._slice_output(self._shared_output_buffer, out_rows)
+        stored = self._slice_output_like(
+            self._shared_output_buffer, out, fallback_rows=out_rows
+        )
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
@@ -155,12 +158,20 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
             return min([cap, *rows])
+        if isinstance(output, LogitsProcessorOutput):
+            rows = [
+                value.shape[0]
+                for field in dataclasses.fields(output)
+                if torch.is_tensor(value := getattr(output, field.name))
+                and value.ndim > 0
+            ]
+            return min([cap, *rows]) if rows else cap
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
         return cap
 
     def _alloc_full_buffer(self, output: Any, size: int) -> Any:
-        """A same-structure buffer as ``output`` but with ``size`` leading rows."""
+        """Allocate capture buffers, preserving structured field capacities."""
         if output is None:
             return None
         if torch.is_tensor(output):
@@ -172,6 +183,20 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     for key, t in output.tensors.items()
                 }
             )
+        if isinstance(output, LogitsProcessorOutput):
+            values = {}
+            for field in dataclasses.fields(output):
+                value = getattr(output, field.name)
+                if torch.is_tensor(value):
+                    values[field.name] = torch.empty_like(value)
+                elif value is None:
+                    values[field.name] = None
+                else:
+                    raise TypeError(
+                        "BCG cannot capture dynamic non-tensor "
+                        f"LogitsProcessorOutput.{field.name}: {type(value)}"
+                    )
+            return LogitsProcessorOutput(**values)
         if isinstance(output, tuple):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
@@ -185,11 +210,41 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
+        if isinstance(output, LogitsProcessorOutput):
+            return self._slice_output_like(
+                output, output, fallback_rows=num_tokens
+            )
         if isinstance(output, tuple):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
+
+    def _slice_output_like(
+        self, output_buffer: Any, template: Any, *, fallback_rows: int
+    ) -> Any:
+        """Return views matching one capture's field-specific output shapes."""
+        if isinstance(output_buffer, LogitsProcessorOutput) and isinstance(
+            template, LogitsProcessorOutput
+        ):
+            values = {}
+            for field in dataclasses.fields(template):
+                source = getattr(template, field.name)
+                buffer = getattr(output_buffer, field.name)
+                if torch.is_tensor(source) and torch.is_tensor(buffer):
+                    if source.ndim == 0:
+                        values[field.name] = buffer
+                    else:
+                        values[field.name] = buffer[: source.shape[0]]
+                elif source is None and buffer is None:
+                    values[field.name] = None
+                else:
+                    raise ValueError(
+                        "BCG logits output structure changed for field "
+                        f"{field.name}: {type(source)} vs {type(buffer)}"
+                    )
+            return LogitsProcessorOutput(**values)
+        return self._slice_output(output_buffer, fallback_rows)
 
     def _copy_output_to_buffer(
         self, output: Any, output_buffer: Any, num_tokens: int
@@ -216,6 +271,35 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 self._copy_output_to_buffer(
                     tensor, output_buffer.tensors[key], num_tokens
                 )
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            for field in dataclasses.fields(output):
+                source = getattr(output, field.name)
+                buffer = getattr(output_buffer, field.name)
+                if torch.is_tensor(source) and torch.is_tensor(buffer):
+                    if source.shape[1:] != buffer.shape[1:]:
+                        raise ValueError(
+                            f"BCG logits field {field.name} trailing shape changed: "
+                            f"{source.shape} vs {buffer.shape}"
+                        )
+                    if source.ndim == 0:
+                        buffer.copy_(source)
+                    else:
+                        if source.shape[0] > buffer.shape[0]:
+                            raise ValueError(
+                                f"BCG logits field {field.name} needs "
+                                f"{source.shape[0]} rows, capacity is {buffer.shape[0]}"
+                            )
+                        buffer[: source.shape[0]].copy_(source)
+                elif source is None and buffer is None:
+                    continue
+                else:
+                    raise ValueError(
+                        "BCG logits output structure changed for field "
+                        f"{field.name}: {type(source)} vs {type(buffer)}"
+                    )
             return
         if isinstance(output, (list, tuple)) and isinstance(
             output_buffer, type(output)

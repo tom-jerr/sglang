@@ -21,7 +21,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -65,6 +64,19 @@ class ForwardMetadata:
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None
+
+    # Stable per-bucket inputs used when the GDN body is captured by the
+    # breakable prefill CUDA graph. They are refreshed in place before replay
+    # so captured kernels never depend on a live Python ForwardBatch.
+    gdn_has_initial_states: Optional[torch.Tensor] = None
+    gdn_chunk_indices: Optional[torch.Tensor] = None
+    # Fixed-capacity radix-track masks for captured GDN prefill. A step is 0
+    # for a live row and -1 for a padded/no-op row.
+    gdn_track_conv_steps: Optional[torch.Tensor] = None
+    gdn_track_ssm_h_steps: Optional[torch.Tensor] = None
+    gdn_track_ssm_final_steps: Optional[torch.Tensor] = None
+    gdn_bcg_token_capacity: int = 0
+    gdn_bcg_request_capacity: int = 0
 
 
 @dataclass(kw_only=True)
@@ -159,7 +171,6 @@ class Mamba2Metadata(ForwardMetadata):
 
         p = 0  # num of insertions
         for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
-
             # if does not divide chunk_size, then there is one chunk insertion
             p += s % chunk_size > 0
 

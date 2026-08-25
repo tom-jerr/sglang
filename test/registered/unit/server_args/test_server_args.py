@@ -90,6 +90,28 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
 
+    def test_gdn_bcg_tracking_capture_threshold_cli(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            [
+                "--model-path",
+                "dummy-model",
+                "--gdn-bcg-tracking-capture-max-tokens",
+                "16384",
+            ]
+        )
+        self.assertEqual(parsed.gdn_bcg_tracking_capture_max_tokens, 16384)
+
+        with self.assertRaisesRegex(
+            ValueError, "gdn-bcg-tracking-capture-max-tokens must be non-negative"
+        ):
+            args = ServerArgs(
+                model_path="dummy",
+                gdn_bcg_tracking_capture_max_tokens=-1,
+            )
+            args._handle_mamba_backend()
+
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)

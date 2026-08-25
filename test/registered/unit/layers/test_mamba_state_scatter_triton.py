@@ -18,6 +18,8 @@ try:
         _require_entry_contiguous_dst,
         fused_conv_window_scatter_with_mask,
         fused_mamba_state_scatter_with_mask,
+        scatter_gdn_prefill_conv_states_with_mask,
+        scatter_gdn_prefill_states_with_mask,
     )
 
     _FUSED_IMPORT_ERROR = None
@@ -25,6 +27,8 @@ except Exception as e:  # pragma: no cover
     _require_entry_contiguous_dst = None
     fused_conv_window_scatter_with_mask = None
     fused_mamba_state_scatter_with_mask = None
+    scatter_gdn_prefill_conv_states_with_mask = None
+    scatter_gdn_prefill_states_with_mask = None
     _FUSED_IMPORT_ERROR = e
 
 from sglang.srt.mem_cache.layout.page_major import (
@@ -226,6 +230,45 @@ class TestMambaStateScatterCorrectness(unittest.TestCase):
 
         torch.testing.assert_close(ssm_fused, ssm_ref)
         torch.testing.assert_close(conv_fused, conv_ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
+    def test_gdn_prefill_tracking_scatter_matches_reference(self):
+        """Capture-stable GDN tracking must skip padded rows before reads."""
+        if scatter_gdn_prefill_states_with_mask is None:
+            self.skipTest(f"GDN tracking scatter import failed: {_FUSED_IMPORT_ERROR}")
+
+        device = torch.device("cuda")
+        torch.manual_seed(43)
+
+        src_states = torch.randn(7, 2, 3, device=device, dtype=torch.bfloat16)
+        dst_states = torch.randn(11, 2, 3, device=device, dtype=torch.bfloat16)
+        expected_states = dst_states.clone()
+        src_indices = torch.tensor([4, 99, 1, 6], device=device)
+        dst_indices = torch.tensor([8, 99, 3, 0], device=device)
+        steps = torch.tensor([0, -1, 0, -1], device=device, dtype=torch.int32)
+        expected_states[8] = src_states[4]
+        expected_states[3] = src_states[1]
+
+        scatter_gdn_prefill_states_with_mask(
+            dst_states, src_states, src_indices, dst_indices, steps
+        )
+        torch.testing.assert_close(dst_states, expected_states)
+
+        channels, tokens, window = 5, 13, 3
+        src_conv = torch.randn(channels, tokens, device=device, dtype=torch.bfloat16)
+        dst_conv = torch.randn(11, channels, window, device=device, dtype=torch.float16)
+        expected_conv = dst_conv.clone()
+        token_indices = torch.tensor(
+            [[2, 3, 4], [99, 99, 99], [7, 8, 9], [99, 99, 99]],
+            device=device,
+        )
+        expected_conv[8] = src_conv[:, token_indices[0]].to(dst_conv.dtype)
+        expected_conv[3] = src_conv[:, token_indices[2]].to(dst_conv.dtype)
+
+        scatter_gdn_prefill_conv_states_with_mask(
+            dst_conv, src_conv, token_indices, dst_indices, steps
+        )
+        torch.testing.assert_close(dst_conv, expected_conv)
 
 
 def _make_envelope_views(device="cpu"):

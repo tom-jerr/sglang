@@ -128,6 +128,23 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
+    def can_capture_attention_body(
+        self, layer, forward_batch: ForwardBatch
+    ) -> bool:
+        """Whether this attention body may stay inside a breakable graph.
+
+        Attention remains an eager break by default. Backends opting in must
+        also provide capture-stable metadata and reject unsupported live
+        batches in :meth:`can_replay_captured_attention_body`.
+        """
+        return False
+
+    def can_replay_captured_attention_body(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        """Whether a live batch satisfies the topology captured at startup."""
+        return True
+
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
         Override only for audited deviations from this conservative default."""

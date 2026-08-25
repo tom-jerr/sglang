@@ -1124,6 +1124,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if self._has_inactive_dp_rank(forward_batch):
             return False
 
+        if (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and self.use_captured_attn_metadata
+            and not self.model_runner.attn_backend.can_replay_captured_attention_body(
+                forward_batch
+            )
+        ):
+            return False
+
         # Non-DP local check (sole decision for tp-only).
         if not self.can_replay_locally(
             batch_size=forward_batch.batch_size,

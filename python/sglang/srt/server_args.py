@@ -2665,6 +2665,14 @@ class ServerArgs:
     mamba_track_interval: A[
         int, "The interval to track the mamba state during decode.", NS("exec.mamba")
     ] = 256
+    gdn_bcg_tracking_capture_max_tokens: A[
+        int,
+        "Maximum prefill token bucket whose GDN radix-tracking metadata is "
+        "captured inside a breakable CUDA graph. Larger buckets retain the "
+        "per-layer eager break; 0 disables tracking capture. Increase only "
+        "after profiling the target GPU and workload.",
+        NS("exec.mamba"),
+    ] = 512
     enable_int8_mamba_checkpoint: A[
         bool,
         "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
@@ -6561,6 +6569,11 @@ class ServerArgs:
     def _handle_mamba_backend(self):
         if self.mamba_cache_philox_rounds < 0:
             raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
+
+        if self.gdn_bcg_tracking_capture_max_tokens < 0:
+            raise ValueError(
+                "--gdn-bcg-tracking-capture-max-tokens must be non-negative."
+            )
 
         if self.mamba_max_states_per_path == 0 or self.mamba_max_states_per_path < -1:
             raise ValueError(

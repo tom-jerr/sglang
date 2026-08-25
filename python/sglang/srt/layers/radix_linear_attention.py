@@ -94,7 +94,10 @@ class RadixLinearAttention(nn.Module):
                 dtype=mixed_qkv.dtype,
                 device=mixed_qkv.device,
             )
-            if is_in_breakable_cuda_graph():
+            attn_backend = get_attn_backend()
+            if is_in_breakable_cuda_graph() and not attn_backend.can_capture_attention_body(
+                self, forward_batch
+            ):
                 bcg_unified_linear_attention_with_output(
                     mixed_qkv,
                     a,

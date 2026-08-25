@@ -1,7 +1,7 @@
+from collections.abc import Sequence
 from typing import Optional, Tuple, Union
 
 import torch
-
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
@@ -15,11 +15,17 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_schedule,
+    mamba_cache_chunk_size,
+)
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
@@ -29,6 +35,8 @@ if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
+else:
+    FLA_CHUNK_SIZE = 64
 
 if is_cuda() or is_hip() or is_xpu():
     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
@@ -37,7 +45,46 @@ if is_cuda() or is_hip() or is_xpu():
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 
+
+def _gdn_bcg_chunk_plan_capacity(num_tokens: int, max_real_requests: int) -> int:
+    """Maximum number of FLA chunks for ``num_tokens`` over bounded requests."""
+    if num_tokens <= 0:
+        return 1
+    max_real_requests = max(1, min(max_real_requests, num_tokens))
+    return min(
+        num_tokens,
+        (num_tokens + FLA_CHUNK_SIZE - 1) // FLA_CHUNK_SIZE + max_real_requests - 1,
+    )
+
+
+def _build_gdn_bcg_chunk_plan(
+    seq_lens: Sequence[int], *, capacity: int, dummy_sequence: int
+) -> torch.Tensor:
+    """Build a fixed-size FLA ``(sequence, chunk)`` plan on CPU.
+
+    Unused rows point at a zero-length dummy sequence. FLA kernels already
+    mask zero-length variable-length sequences, so the graph launch topology
+    stays fixed while the request layout changes at replay.
+    """
+    rows = [
+        (seq_id, chunk_id)
+        for seq_id, seq_len in enumerate(seq_lens)
+        for chunk_id in range((int(seq_len) + FLA_CHUNK_SIZE - 1) // FLA_CHUNK_SIZE)
+    ]
+    if len(rows) > capacity:
+        raise ValueError(
+            f"GDN BCG chunk plan needs {len(rows)} rows, capacity is {capacity}"
+        )
+    rows.extend([(dummy_sequence, 0)] * (capacity - len(rows)))
+    return torch.tensor(rows, dtype=torch.int32)
+
+
 if is_cuda():
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        fused_mamba_state_scatter_with_mask,
+        scatter_gdn_prefill_conv_states_with_mask,
+        scatter_gdn_prefill_states_with_mask,
+    )
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn as causal_conv1d_fn_cuda,
     )
@@ -387,14 +434,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
         if not is_cpu() and not is_npu():
-            assert (
-                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
-            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+            assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
+                f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+            )
 
         backends = model_runner.linear_attn_backends
         self.linear_attn_backends = backends
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
+        )
+        # CUDA Triton prefill can keep the GDN body inside BCG once its
+        # variable request layout is expressed through stable metadata. Other
+        # kernels retain the established eager break until separately audited.
+        self.use_captured_forward_metadata_for_breakable_cuda_graph = (
+            is_cuda()
+            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+            and not get_memory().enable_page_major_kv_layout
+            and not self.enable_unified_memory
+            and not model_runner.server_args.enable_prefill_context_parallel
+            and model_runner.server_args.attn_cp_size == 1
+        )
+        self.bcg_radix_tracking_enabled = (
+            model_runner.server_args.enable_mamba_extra_buffer()
+            and not get_memory().disable_radix_cache
+        )
+        # Fixed-capacity radix-tracking metadata removes the per-GDN-layer host
+        # break, but its padded tracking work grows with the captured bucket.
+        # Keep the conservative default configurable so deployments can tune
+        # the crossover point for their GPU and request-length distribution.
+        self.bcg_tracking_capture_max_tokens = (
+            get_exec().mamba.gdn_bcg_tracking_capture_max_tokens
         )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
@@ -404,6 +473,266 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+
+    @staticmethod
+    def _has_active_mamba_tracking(forward_batch: ForwardBatch) -> bool:
+        mask = forward_batch.mamba_track_mask
+        return mask is not None and bool(mask.any())
+
+    def can_capture_attention_body(
+        self, layer: RadixLinearAttention, forward_batch: ForwardBatch
+    ) -> bool:
+        del layer
+        metadata = self.forward_metadata
+        return bool(
+            self.use_captured_forward_metadata_for_breakable_cuda_graph
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and metadata is not None
+            and metadata.gdn_chunk_indices is not None
+        )
+
+    def can_replay_captured_attention_body(self, forward_batch: ForwardBatch) -> bool:
+        if not self.use_captured_forward_metadata_for_breakable_cuda_graph:
+            return True
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            return False
+        return True
+
+    def _populate_breakable_prefill_metadata(
+        self, metadata: ForwardMetadata, forward_batch: ForwardBatch
+    ) -> None:
+        seq_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+        bs = len(seq_lens)
+        raw_num_tokens = sum(seq_lens)
+        request_capacity = metadata.gdn_bcg_request_capacity
+        token_capacity = metadata.gdn_bcg_token_capacity
+        max_real_requests = request_capacity - 1  # final slot is always dummy
+        if bs > max_real_requests:
+            raise ValueError(
+                f"GDN BCG batch has {bs} requests, capacity is {max_real_requests}"
+            )
+        if raw_num_tokens > token_capacity:
+            raise ValueError(
+                f"GDN BCG batch has {raw_num_tokens} tokens, capacity is {token_capacity}"
+            )
+
+        query_start_loc_cpu = torch.full(
+            (request_capacity + 1,), raw_num_tokens, dtype=torch.int32
+        )
+        query_start_loc_cpu[0] = 0
+        if bs:
+            query_start_loc_cpu[1 : bs + 1] = torch.tensor(
+                seq_lens, dtype=torch.int32
+            ).cumsum(0)
+        metadata.query_start_loc.copy_(query_start_loc_cpu)
+
+        metadata.mamba_cache_indices.fill_(self.pad_slot_id)
+        if bs:
+            mamba_indices = self.req_to_token_pool.get_mamba_indices(
+                forward_batch.req_pool_indices[:bs]
+            )
+            mamba_indices = self._translate_mamba_indices(mamba_indices).to(
+                dtype=metadata.mamba_cache_indices.dtype
+            )
+            metadata.mamba_cache_indices[:bs].copy_(mamba_indices)
+
+        metadata.gdn_has_initial_states.zero_()
+        if bs:
+            metadata.gdn_has_initial_states[:bs].copy_(
+                forward_batch.extend_prefix_lens[:bs] > 0
+            )
+
+        chunk_plan = _build_gdn_bcg_chunk_plan(
+            seq_lens,
+            capacity=metadata.gdn_chunk_indices.shape[0],
+            dummy_sequence=request_capacity - 1,
+        )
+        metadata.gdn_chunk_indices.copy_(chunk_plan)
+
+        # Keep radix tracking capture-stable too. Without this, every request
+        # crossing the normal cache checkpoint makes the entire prefill graph
+        # fall back to eager execution.
+        metadata.gdn_track_conv_steps.fill_(-1)
+        metadata.gdn_track_ssm_h_steps.fill_(-1)
+        metadata.gdn_track_ssm_final_steps.fill_(-1)
+        metadata.track_conv_indices.zero_()
+        metadata.conv_states_mask_indices.zero_()
+        metadata.track_ssm_h_src.zero_()
+        metadata.track_ssm_h_dst.zero_()
+        metadata.track_ssm_final_src.zero_()
+        metadata.track_ssm_final_dst.zero_()
+
+        track_mask = forward_batch.mamba_track_mask
+        track_dst = forward_batch.mamba_track_indices
+        track_seqlens = forward_batch.mamba_track_seqlens
+        if (
+            bs == 0
+            or track_mask is None
+            or track_dst is None
+            or track_seqlens is None
+            or not bool(track_mask.any())
+        ):
+            return
+
+        track_mask_cpu = track_mask[:bs].detach().to("cpu", dtype=torch.bool)
+        track_dst_cpu = (
+            self._translate_mamba_indices(track_dst[:bs])
+            .detach()
+            .to("cpu", dtype=torch.int64)
+        )
+        valid_track = track_mask_cpu & (track_dst_cpu >= 0)
+        if not bool(valid_track.any()):
+            return
+
+        prefix_cpu = (
+            forward_batch.extend_prefix_lens[:bs].detach().to("cpu", dtype=torch.int64)
+        )
+        track_lens_cpu = track_seqlens[:bs].detach().to("cpu", dtype=torch.int64)
+        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        starts_cpu = torch.zeros((bs,), dtype=torch.int64)
+        if bs > 1:
+            starts_cpu[1:] = seq_lens_cpu[:-1].cumsum(0)
+
+        cache_chunk = mamba_cache_chunk_size()
+        lens_to_track = track_lens_cpu - prefix_cpu
+        aligned_lens = (lens_to_track // cache_chunk) * cache_chunk
+        conv_len = self.conv_states_shape[-1]
+        conv_starts = starts_cpu + aligned_lens - conv_len
+        conv_offsets = torch.arange(conv_len, dtype=torch.int64)
+        conv_indices = (conv_starts[:, None] + conv_offsets[None, :]).clamp(
+            0, max(raw_num_tokens - 1, 0)
+        )
+        metadata.track_conv_indices[:bs].copy_(conv_indices)
+        metadata.conv_states_mask_indices[:bs].copy_(track_dst_cpu)
+        metadata.gdn_track_conv_steps[:bs].copy_(
+            torch.where(
+                valid_track,
+                torch.zeros_like(track_dst_cpu, dtype=torch.int32),
+                torch.full_like(track_dst_cpu, -1, dtype=torch.int32),
+            )
+        )
+
+        # Triton GDN returns h in the same sequence-major order as the real
+        # prefix of gdn_chunk_indices. The padded plan rows are never selected.
+        num_h_states = (seq_lens_cpu + FLA_CHUNK_SIZE - 1) // FLA_CHUNK_SIZE
+        h_offsets = torch.zeros_like(num_h_states)
+        if bs > 1:
+            h_offsets[1:] = num_h_states[:-1].cumsum(0)
+        aligned = (lens_to_track % cache_chunk) == 0
+        h_valid = valid_track & ~aligned
+        final_valid = valid_track & aligned
+        h_src = h_offsets + lens_to_track // cache_chunk
+
+        metadata.track_ssm_h_src[:bs].copy_(h_src)
+        metadata.track_ssm_h_dst[:bs].copy_(track_dst_cpu)
+        metadata.track_ssm_final_src[:bs].copy_(
+            metadata.mamba_cache_indices[:bs].detach().to("cpu", dtype=torch.int64)
+        )
+        metadata.track_ssm_final_dst[:bs].copy_(track_dst_cpu)
+        metadata.gdn_track_ssm_h_steps[:bs].copy_(
+            torch.where(
+                h_valid,
+                torch.zeros_like(track_dst_cpu, dtype=torch.int32),
+                torch.full_like(track_dst_cpu, -1, dtype=torch.int32),
+            )
+        )
+        metadata.gdn_track_ssm_final_steps[:bs].copy_(
+            torch.where(
+                final_valid,
+                torch.zeros_like(track_dst_cpu, dtype=torch.int32),
+                torch.full_like(track_dst_cpu, -1, dtype=torch.int32),
+            )
+        )
+
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self, forward_batch: ForwardBatch
+    ) -> ForwardMetadata:
+        token_capacity = int(forward_batch.input_ids.shape[0])
+        if (
+            self.bcg_radix_tracking_enabled
+            and token_capacity > self.bcg_tracking_capture_max_tokens
+        ):
+            # Returning ordinary metadata makes can_capture_attention_body
+            # retain the existing per-layer eager breaks for this bucket.
+            self.init_forward_metadata(forward_batch)
+            return self.forward_metadata
+        max_real_requests = min(self.req_to_token_pool.size, token_capacity)
+        # An extra zero-length request gives padded chunk-plan rows a target
+        # that can never alias a real state slot.
+        request_capacity = max_real_requests + 1
+        chunk_capacity = _gdn_bcg_chunk_plan_capacity(token_capacity, max_real_requests)
+        metadata = ForwardMetadata(
+            query_start_loc=torch.empty(
+                (request_capacity + 1,), dtype=torch.int32, device=self.device
+            ),
+            mamba_cache_indices=torch.full(
+                (request_capacity,),
+                self.pad_slot_id,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            gdn_has_initial_states=torch.zeros(
+                (request_capacity,), dtype=torch.bool, device=self.device
+            ),
+            gdn_chunk_indices=torch.empty(
+                (chunk_capacity, 2), dtype=torch.int32, device=self.device
+            ),
+            track_conv_indices=torch.zeros(
+                (request_capacity, self.conv_states_shape[-1]),
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            conv_states_mask_indices=torch.zeros(
+                (request_capacity,), dtype=torch.int64, device=self.device
+            ),
+            track_ssm_h_src=torch.zeros(
+                (request_capacity,), dtype=torch.int64, device=self.device
+            ),
+            track_ssm_h_dst=torch.zeros(
+                (request_capacity,), dtype=torch.int64, device=self.device
+            ),
+            track_ssm_final_src=torch.zeros(
+                (request_capacity,), dtype=torch.int64, device=self.device
+            ),
+            track_ssm_final_dst=torch.zeros(
+                (request_capacity,), dtype=torch.int64, device=self.device
+            ),
+            gdn_track_conv_steps=torch.full(
+                (request_capacity,), -1, dtype=torch.int32, device=self.device
+            ),
+            gdn_track_ssm_h_steps=torch.full(
+                (request_capacity,), -1, dtype=torch.int32, device=self.device
+            ),
+            gdn_track_ssm_final_steps=torch.full(
+                (request_capacity,), -1, dtype=torch.int32, device=self.device
+            ),
+            # The tracking branch is always present in the captured graph;
+            # ordinary rows are masked no-ops.
+            has_mamba_track_mask=True,
+            gdn_bcg_token_capacity=token_capacity,
+            gdn_bcg_request_capacity=request_capacity,
+        )
+        self._populate_breakable_prefill_metadata(metadata, forward_batch)
+        self.forward_metadata = metadata
+        return metadata
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata: ForwardMetadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        del static_forward_batch
+        if capture_metadata.gdn_chunk_indices is None:
+            self.init_forward_metadata(forward_batch)
+            return
+        self._populate_breakable_prefill_metadata(capture_metadata, forward_batch)
+        self.forward_metadata = capture_metadata
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -554,36 +883,58 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             intermediate_state_indices = self.verify_intermediate_state_indices
         else:
-            has_initial_states = forward_batch.extend_prefix_lens > 0
+            has_initial_states = (
+                forward_metadata.gdn_has_initial_states
+                if forward_metadata.gdn_has_initial_states is not None
+                else forward_batch.extend_prefix_lens > 0
+            )
 
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
         # slot layout, so they silently drop the write to the strided envelope
-        # pool. Run them on contiguous per-sequence copies (identity-indexed) and
-        # scatter the result back. No-op for the default contiguous pool.
+        # pool. CUDA causal conv also requires its working state dtype to match
+        # the activation. Use request-local copies for either constraint and
+        # scatter the result back.
         # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
         # proper indexed writes and handle non-contiguous pools directly via
         # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
         # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
         # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
         # int64 indexing, like packed_decode / causal_conv1d_update already do.
-        needs_state_gather = (
+        needs_conv_gather = (
             (not is_target_verify)
             and (not is_cpu())
-            and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
+            and (
+                not conv_states.is_contiguous()
+                or (is_cuda() and conv_states.dtype != mixed_qkv.dtype)
+            )
         )
-        if needs_state_gather:
-            conv_states_contig = conv_states[cache_indices].contiguous()
-            ssm_states_contig = ssm_states[cache_indices].contiguous()
-            state_cache_indices = torch.arange(
+        needs_ssm_gather = (
+            (not is_target_verify) and (not is_cpu()) and not ssm_states.is_contiguous()
+        )
+        if needs_conv_gather or needs_ssm_gather:
+            local_cache_indices = torch.arange(
                 cache_indices.shape[0],
                 device=cache_indices.device,
                 dtype=cache_indices.dtype,
             )
+            local_cache_indices.masked_fill_(cache_indices < 0, self.pad_slot_id)
+
+        if needs_conv_gather:
+            conv_states_contig = conv_states[cache_indices.clamp_min(0)].contiguous()
+            if conv_states_contig.dtype != mixed_qkv.dtype:
+                conv_states_contig = conv_states_contig.to(mixed_qkv.dtype)
+            conv_cache_indices = local_cache_indices
         else:
             conv_states_contig = conv_states
+            conv_cache_indices = cache_indices
+
+        if needs_ssm_gather:
+            ssm_states_contig = ssm_states[cache_indices.clamp_min(0)].contiguous()
+            ssm_cache_indices = local_cache_indices
+        else:
             ssm_states_contig = ssm_states
-            state_cache_indices = cache_indices
+            ssm_cache_indices = cache_indices
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
@@ -608,23 +959,39 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:
-                mixed_qkv_to_track = mixed_qkv[
-                    :, forward_metadata.track_conv_indices
-                ].transpose(0, 1)
-                conv_states[forward_metadata.conv_states_mask_indices] = (
-                    mixed_qkv_to_track
-                )
+                if forward_metadata.gdn_track_conv_steps is not None:
+                    scatter_gdn_prefill_conv_states_with_mask(
+                        dst=conv_states,
+                        src=mixed_qkv,
+                        src_token_indices=forward_metadata.track_conv_indices,
+                        dst_indices=forward_metadata.conv_states_mask_indices,
+                        steps=forward_metadata.gdn_track_conv_steps,
+                    )
+                else:
+                    mixed_qkv_to_track = mixed_qkv[
+                        :, forward_metadata.track_conv_indices
+                    ].transpose(0, 1)
+                    conv_states[forward_metadata.conv_states_mask_indices] = (
+                        mixed_qkv_to_track.to(conv_states.dtype)
+                    )
 
+            conv_kwargs = dict(
+                activation=layer.activation,
+                conv_states=conv_states_contig,
+                has_initial_state=has_initial_states,
+                cache_indices=conv_cache_indices,
+                query_start_loc=query_start_loc,
+            )
+            # The list-valued seq_lens fast path builds a host launch grid and
+            # cannot be replayed. Omitting it selects the compiled CUDA kernel;
+            # its temporary contiguous copy is captured with a stable address.
+            if forward_metadata.gdn_chunk_indices is None:
+                conv_kwargs["seq_lens_cpu"] = forward_batch.extend_seq_lens_cpu
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv,
                 layer.conv_weights,
                 layer.bias,
-                activation=layer.activation,
-                conv_states=conv_states_contig,
-                has_initial_state=has_initial_states,
-                cache_indices=state_cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                **conv_kwargs,
             ).transpose(0, 1)[:seq_len]
 
         actual_seq_len = mixed_qkv.shape[0]
@@ -727,7 +1094,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 g=g,
                 beta=beta,
                 ssm_states=ssm_states_contig,
-                cache_indices=state_cache_indices,
+                cache_indices=ssm_cache_indices,
                 query_start_loc=query_start_loc,
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
@@ -736,6 +1103,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
+                chunk_indices=forward_metadata.gdn_chunk_indices,
             )
 
             if is_npu() and last_recurrent_state is not None:
@@ -744,16 +1112,49 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 ssm_states[cache_indices] = last_recurrent_state
 
-            if needs_state_gather:
-                # Scatter the in-place-updated contiguous copies back to the
-                # strided envelope pool (advanced indexing handles the strides).
-                conv_states[cache_indices] = conv_states_contig
-                ssm_states[cache_indices] = ssm_states_contig
+            if needs_conv_gather:
+                if conv_states.is_contiguous() and is_cuda():
+                    scatter_steps = torch.where(
+                        cache_indices >= 0,
+                        torch.zeros_like(cache_indices),
+                        torch.full_like(cache_indices, self.pad_slot_id),
+                    )
+                    fused_mamba_state_scatter_with_mask(
+                        dst=conv_states.unsqueeze(0),
+                        src=conv_states_contig.unsqueeze(0).unsqueeze(2),
+                        dst_indices_raw=cache_indices,
+                        step_indices_raw=scatter_steps,
+                    )
+                else:
+                    valid = cache_indices >= 0
+                    conv_states[cache_indices[valid]] = conv_states_contig[valid].to(
+                        conv_states.dtype
+                    )
+            if needs_ssm_gather:
+                valid = cache_indices >= 0
+                ssm_states[cache_indices[valid]] = ssm_states_contig[valid]
 
             if forward_metadata.has_mamba_track_mask:
-                self._track_mamba_state_extend(
-                    forward_batch, h, ssm_states, forward_metadata
-                )
+                if forward_metadata.gdn_track_ssm_h_steps is not None:
+                    assert h is not None
+                    scatter_gdn_prefill_states_with_mask(
+                        dst=ssm_states,
+                        src=h.squeeze(0),
+                        src_indices=forward_metadata.track_ssm_h_src,
+                        dst_indices=forward_metadata.track_ssm_h_dst,
+                        steps=forward_metadata.gdn_track_ssm_h_steps,
+                    )
+                    scatter_gdn_prefill_states_with_mask(
+                        dst=ssm_states,
+                        src=ssm_states,
+                        src_indices=forward_metadata.track_ssm_final_src,
+                        dst_indices=forward_metadata.track_ssm_final_dst,
+                        steps=forward_metadata.gdn_track_ssm_final_steps,
+                    )
+                else:
+                    self._track_mamba_state_extend(
+                        forward_batch, h, ssm_states, forward_metadata
+                    )
 
         return core_attn_out
 
