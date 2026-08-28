@@ -1,0 +1,7 @@
+sm_group_num: 3
+green_context_backend: torch
+split_forward_token_budget: 65536
+manual_divisions:
+  # Same fixed scheduler shape as the Runtime API variant, but ordinary
+  # streams are not spatially restricted. This isolates SM partitioning.
+  - [80, 48, 1]

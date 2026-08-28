@@ -1,0 +1,7 @@
+sm_group_num: 3
+green_context_backend: runtime
+split_forward_token_budget: 65536
+manual_divisions:
+  # A fixed split avoids cross-execution-context allocator/event reuse while
+  # requests move through adaptive thresholds. RTX 4090 has 128 SMs.
+  - [80, 48, 1]

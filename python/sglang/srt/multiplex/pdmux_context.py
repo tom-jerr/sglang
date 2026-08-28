@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass, field
 from typing import List
 
@@ -6,9 +7,12 @@ import yaml
 
 STREAM_GROUPS = []
 SM_COUNTS = []
+GREEN_CONTEXT_OWNERS = []
 SM_GROUP_NUM = 8  # Default number of SM groups
 CURRENT_STREAM_IDX = 0
 CURRENT_STREAM_GROUP = None
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -19,6 +23,7 @@ class PDMuxConfig:
     )  # [prefill_sm, decode_sm, decode_bs_threshold]
     split_forward_token_budget: int = 65536
     decode_bs_divisor: int = 36
+    green_context_backend: str = "auto"
 
 
 def load_pdmux_config(config_path: str) -> PDMuxConfig:
@@ -49,7 +54,43 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         manual_divisions=manual_divisions,
         split_forward_token_budget=raw.get("split_forward_token_budget", 65536),
         decode_bs_divisor=raw.get("decode_bs_divisor", 36),
+        green_context_backend=raw.get("green_context_backend", "auto"),
     )
+
+
+def _create_green_context_stream_pair(
+    prefill_sm: int, decode_sm: int, gpu_id: int, backend: str
+):
+    if backend not in ("auto", "runtime", "sgl_kernel", "torch"):
+        raise ValueError(
+            "green_context_backend must be one of: auto, runtime, sgl_kernel, torch"
+        )
+
+    if backend == "torch":
+        return torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id)
+
+    if backend in ("auto", "runtime"):
+        from sglang.srt.multiplex.green_context import (
+            GreenContextRuntimeError,
+            create_green_context_stream_pair,
+        )
+
+        try:
+            owner = create_green_context_stream_pair(prefill_sm, decode_sm, gpu_id)
+            GREEN_CONTEXT_OWNERS.append(owner)
+            return owner.streams
+        except GreenContextRuntimeError:
+            if backend == "runtime":
+                raise
+            logger.warning(
+                "CUDA Runtime green-context setup failed; falling back to "
+                "sgl_kernel Driver API",
+                exc_info=True,
+            )
+
+    from sgl_kernel import spatial
+
+    return spatial.create_greenctx_stream_by_value(prefill_sm, decode_sm, gpu_id)
 
 
 def get_arch_constraints(compute_capability):
@@ -102,12 +143,10 @@ def divide_sm(total_sms, compute_capability, groups):
 
 
 def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
-    from sgl_kernel import spatial
-
-    global STREAM_GROUPS, SM_COUNTS, SM_GROUP_NUM, CURRENT_STREAM_IDX, CURRENT_STREAM_GROUP
+    global STREAM_GROUPS, SM_COUNTS, GREEN_CONTEXT_OWNERS, SM_GROUP_NUM, CURRENT_STREAM_IDX, CURRENT_STREAM_GROUP
     # for pd_multiplexing, Init stream_groups
     device = torch.cuda.current_device()
-    total_sm_count = spatial.get_sm_available(gpu_id)
+    total_sm_count = torch.cuda.get_device_properties(gpu_id).multi_processor_count
     # (prefill_sm_count, decode_sm_count)
     if config.manual_divisions:
         divisions = [
@@ -126,12 +165,18 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
     SM_COUNTS.extend(divisions)  # Add the divided SM counts
     SM_COUNTS.append((0, total_sm_count))  # Normal stream for decode
     STREAM_GROUPS = []
+    GREEN_CONTEXT_OWNERS = []
     STREAM_GROUPS.append(
         (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
     )  # Normal stream for prefill
     for prefill_sm, decode_sm in divisions:
         STREAM_GROUPS.append(
-            (spatial.create_greenctx_stream_by_value(prefill_sm, decode_sm, gpu_id))
+            _create_green_context_stream_pair(
+                prefill_sm,
+                decode_sm,
+                gpu_id,
+                config.green_context_backend,
+            )
         )
     STREAM_GROUPS.append(
         (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
