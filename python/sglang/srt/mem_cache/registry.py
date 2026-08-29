@@ -101,6 +101,11 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         return SWAChunkCache(params)
 
+    if get_memory().enable_unified_pic:
+        # PIC composes with the Python UnifiedRadixCache controller. Validation
+        # rejects alternate/external cache backends before pool construction.
+        return _create_unified_radix_cache(ctx, server_args, params)
+
     if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
         # lazy import to avoid JIT overhead
         from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp

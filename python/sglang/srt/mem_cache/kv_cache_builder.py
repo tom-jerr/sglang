@@ -31,7 +31,7 @@ from sglang.srt.configs.hybrid_arch import (
     linear_attn_model_spec,
     mamba2_config,
 )
-from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
+from sglang.srt.configs.model_config import AttentionArch, ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
@@ -287,6 +287,48 @@ def build_kv_cache(
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
 
+    pic_config = None
+    if get_memory().enable_unified_pic:
+        incompatible = []
+        if model_config.attention_arch != AttentionArch.MLA:
+            incompatible.append("a non-MLA attention architecture")
+        if is_hybrid_swa or is_hybrid_ssm:
+            incompatible.append("hybrid SWA/SSM layers")
+        if enable_hierarchical_cache:
+            incompatible.append("HiCache")
+        if get_disagg().disaggregation_mode != "null":
+            incompatible.append("PD disaggregation")
+        if not spec_algorithm.is_none():
+            incompatible.append("speculative decoding")
+        if server_args.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+            incompatible.append(f"KV cache dtype {server_args.kv_cache_dtype}")
+        if disable_radix_cache:
+            incompatible.append("disabled radix cache")
+        if get_memory().radix_cache_backend is not None:
+            incompatible.append("an alternate radix cache backend")
+        if get_memory().enable_lmcache or get_memory().enable_flexkv:
+            incompatible.append("an external KV cache backend")
+        if incompatible:
+            raise ValueError(
+                "--enable-unified-pic phase 1 is MLA observer-only and is "
+                f"incompatible with {', '.join(incompatible)}"
+            )
+
+        from sglang.srt.mem_cache.pic.config import PicConfig
+
+        pic_config = PicConfig(
+            min_chunk_tokens=get_memory().unified_pic_min_chunk_tokens,
+            target_chunk_tokens=get_memory().unified_pic_target_chunk_tokens,
+            max_chunk_tokens=get_memory().unified_pic_max_chunk_tokens,
+            max_registry_entries=get_memory().unified_pic_max_registry_entries,
+            model_fingerprint=(
+                f"{server_args.model_path}@{server_args.revision or 'main'}"
+            ),
+            tokenizer_fingerprint=(
+                server_args.tokenizer_path or server_args.model_path
+            ),
+        )
+
     params = CacheInitParams(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
@@ -317,6 +359,7 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        pic_config=pic_config,
     )
 
     tree_cache = create_tree_cache(

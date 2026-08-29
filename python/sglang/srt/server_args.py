@@ -1432,6 +1432,34 @@ class ServerArgs:
         "Track per-session references on UnifiedRadixCache KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",
         NS("memory"),
     ] = False
+    enable_unified_pic: A[
+        bool,
+        "Enable the phase-1 MLA position-independent cache observer. It records "
+        "content-defined PIC spans and delta-rotation plans without bypassing "
+        "prefill. HiCache, PD disaggregation, hybrid attention, and speculative "
+        "decoding are rejected in this phase.",
+        NS("memory"),
+    ] = False
+    unified_pic_min_chunk_tokens: A[
+        int,
+        "Minimum content-defined PIC span length.",
+        NS("memory"),
+    ] = 32
+    unified_pic_target_chunk_tokens: A[
+        int,
+        "Expected content-defined PIC span length; must be a power of two.",
+        NS("memory"),
+    ] = 128
+    unified_pic_max_chunk_tokens: A[
+        int,
+        "Maximum content-defined PIC span length.",
+        NS("memory"),
+    ] = 512
+    unified_pic_max_registry_entries: A[
+        int,
+        "Maximum number of canonical PIC spans retained by the observer registry.",
+        NS("memory"),
+    ] = 100000
 
     # -------------------------------------------------------------------------
     # Logging, metrics, and tracing

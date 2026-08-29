@@ -1053,6 +1053,9 @@ class Req(ReqDllmMixin):
         self.skip_lock_node_ids: dict = {}
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # Populated only by --enable-unified-pic. The phase-1 observer does not
+        # alter prefix_indices or the model forward path.
+        self.pic_observer_plan: Any = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is

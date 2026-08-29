@@ -209,6 +209,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
+        # PIC is an orthogonal content-addressed span index, not another
+        # position-aligned tree value.  Phase 1 observes plans only; it never
+        # rewrites MatchResult.device_indices.
+        self.pic_span_component = None
+        if params.pic_config is not None:
+            from sglang.srt.mem_cache.pic.component import PicSpanComponent
+
+            self.pic_span_component = PicSpanComponent(params.pic_config)
+
         # Streaming session: embedded StreamingSession with self as inner.
         # Always on -- zero overhead when no streaming session is open (the
         # try_* entries short-circuit on non-streaming reqs / real TreeNodes).
@@ -514,6 +523,22 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        if self.pic_span_component is not None and params.req is not None:
+            plan = self.pic_span_component.observe_match(
+                params.key.raw_token_ids(),
+                namespace=self._pic_namespace_for_req(params.req),
+                prefix_tokens=len(result.device_indices),
+            )
+            params.req.pic_observer_plan = plan
+            logger.debug(
+                "PIC observer rid=%s prefix_tokens=%d pic_hit_tokens=%d "
+                "pic_spans=%d misses=%d",
+                params.req.rid,
+                plan.prefix_tokens,
+                plan.hit_tokens,
+                len(plan.hits),
+                len(plan.misses),
+            )
         return result
 
     def is_chunk_cache(self) -> bool:
@@ -906,6 +931,12 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 self.session_refs.register_session_ref(req)
 
+        if self.pic_span_component is not None and is_insert and result is not None:
+            self.pic_span_component.observe_publish(
+                token_ids,
+                namespace=self._pic_namespace_for_req(req),
+            )
+
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -1031,7 +1062,25 @@ class UnifiedRadixCache(BasePrefixCache):
                 insert_params=insert_params,
             )
 
+        if self.pic_span_component is not None:
+            self.pic_span_component.observe_publish(
+                token_ids[:page_aligned_len],
+                namespace=self._pic_namespace_for_req(req),
+            )
+
     # ---- Internal Helpers ----
+
+    def _pic_namespace_for_req(self, req: Req):
+        from sglang.srt.mem_cache.pic.types import PicNamespace
+
+        config = self.pic_span_component.config
+        return PicNamespace(
+            tenant_id=req.cache_salt or "__default_tenant__",
+            session_id=req.session_id,
+            model_fingerprint=config.model_fingerprint,
+            tokenizer_fingerprint=config.tokenizer_fingerprint,
+            cache_format=config.cache_format,
+        )
 
     def _apply_cache_actions(
         self, actions: list[CacheAction | ComponentAction]

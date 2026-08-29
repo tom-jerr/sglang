@@ -8,6 +8,7 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.pic.config import PicConfig
     from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_cache.components.tree_component import (
         TreeComponent,
@@ -55,3 +56,7 @@ class CacheInitParams:
     )
 
     mtp_draft_device_pools: tuple[object, ...] = ()
+
+    # Phase-1 position-independent MLA span observer. None keeps the hot path
+    # byte-for-byte equivalent to ordinary UnifiedRadixCache.
+    pic_config: Optional[PicConfig] = None

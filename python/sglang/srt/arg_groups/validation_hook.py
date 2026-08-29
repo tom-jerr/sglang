@@ -87,6 +87,41 @@ def check_server_args(server_args: Any):
             not cfg.enable_mixed_chunk
         ), "enable_mixed_chunk is required for speculative decoding"
 
+    if cfg.enable_unified_pic:
+        incompatible = []
+        if cfg.enable_hierarchical_cache:
+            incompatible.append("--enable-hierarchical-cache")
+        if cfg.disaggregation_mode != "null":
+            incompatible.append(f"--disaggregation-mode {cfg.disaggregation_mode}")
+        if cfg.speculative_algorithm is not None:
+            incompatible.append(
+                f"--speculative-algorithm {cfg.speculative_algorithm}"
+            )
+        if cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+            incompatible.append(f"--kv-cache-dtype {cfg.kv_cache_dtype}")
+        if cfg.disable_radix_cache:
+            incompatible.append("--disable-radix-cache")
+        if cfg.radix_cache_backend is not None:
+            incompatible.append(f"--radix-cache-backend {cfg.radix_cache_backend}")
+        if cfg.enable_lmcache:
+            incompatible.append("--enable-lmcache")
+        if cfg.enable_flexkv:
+            incompatible.append("--enable-flexkv")
+        if incompatible:
+            raise ValueError(
+                "--enable-unified-pic phase 1 is incompatible with "
+                + ", ".join(incompatible)
+            )
+
+        from sglang.srt.mem_cache.pic.config import PicConfig
+
+        PicConfig(
+            min_chunk_tokens=cfg.unified_pic_min_chunk_tokens,
+            target_chunk_tokens=cfg.unified_pic_target_chunk_tokens,
+            max_chunk_tokens=cfg.unified_pic_max_chunk_tokens,
+            max_registry_entries=cfg.unified_pic_max_registry_entries,
+        )
+
     # Check chunked prefill
     # Skip validation if chunked prefill is disabled (i.e., size <= 0).
     # Skip validation if disaggregation mode is decode.
