@@ -1,0 +1,98 @@
+{
+  "date": "2026-08-30",
+  "hardware": {
+    "gpu_count": 2,
+    "gpu_model": "NVIDIA GeForce RTX 4090",
+    "interconnect": "PCIe/PHB (no NVLink)",
+    "parallelism": "TP=1, PP=2"
+  },
+  "model": {
+    "name": "TechxGenus/DeepSeek-V2-Lite-AWQ",
+    "revision": "f96b1c6ffa7c53b642b6e6bbf1b75405d1558f81",
+    "weight_format": "AWQ INT4",
+    "kv_cache_dtype": "FP16"
+  },
+  "sglang_revision": "97781eb7f33ea3b64f8a35bf04dd63833383f292",
+  "datasets": {
+    "gsm8k_revision": "740312add88f781978c0658806c59bc2815b9866",
+    "aime_2024_revision": "2fe88a2f1091d5048c0f36abc874fb997b3dd99a"
+  },
+  "workload": {
+    "concurrency": 8,
+    "num_shots": 16,
+    "shared_context_tokens": 3410,
+    "request_local_offset_levels": 8,
+    "sampling": "greedy",
+    "stop": [
+      "Question",
+      "Assistant:",
+      "<|separator|>"
+    ]
+  },
+  "gsm8k_first_100": {
+    "prompt_tokens": 392063,
+    "prompt_tokens_min": 3565,
+    "prompt_tokens_max": 4299,
+    "max_new_tokens": 256,
+    "baseline": {
+      "correct": 30,
+      "accuracy": 0.3,
+      "truncated": 20
+    },
+    "pic_observer": {
+      "correct": 31,
+      "accuracy": 0.31,
+      "truncated": 20
+    },
+    "accuracy_delta": 0.01,
+    "correctness_flips": [
+      {
+        "case_id": 42,
+        "direction": "baseline_wrong_to_pic_correct"
+      }
+    ],
+    "prediction_matches": 85,
+    "token_exact_matches": 72,
+    "pic_candidate": {
+      "requests_with_hits": 100,
+      "hit_tokens": 312890,
+      "coverage": 0.798060515784453,
+      "spans": 1920,
+      "stage_conflicts": 0
+    }
+  },
+  "aime_2024_all_30": {
+    "prompt_tokens": 118652,
+    "prompt_tokens_min": 3581,
+    "prompt_tokens_max": 4337,
+    "max_new_tokens": 512,
+    "baseline": {
+      "correct": 0,
+      "accuracy": 0.0,
+      "invalid": 2,
+      "truncated": 20
+    },
+    "pic_observer": {
+      "correct": 0,
+      "accuracy": 0.0,
+      "invalid": 2,
+      "truncated": 21
+    },
+    "accuracy_delta": 0.0,
+    "correctness_flips": [],
+    "prediction_matches": 22,
+    "token_exact_matches": 20,
+    "pic_candidate": {
+      "requests_with_hits": 30,
+      "hit_tokens": 93731,
+      "coverage": 0.7899656137275394,
+      "spans": 574,
+      "stage_conflicts": 0
+    }
+  },
+  "interpretation": {
+    "observed_accuracy_regression": false,
+    "physical_kv_reuse_enabled": false,
+    "note": "Phase 1 is observer-only. These results validate admission, span discovery, concurrency, and absence of an observed accuracy loss; they do not validate the future c_KV remap or delta-rotation data path."
+  }
+}

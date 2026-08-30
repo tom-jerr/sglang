@@ -148,6 +148,58 @@ the latency differences from the observer runs are not claimed as PIC speedups;
 only candidate coverage, concurrent safety, and the sequential output oracle
 are phase-1 conclusions.
 
+## Long-context GSM8K and AIME-2024 accuracy
+
+The second two-GPU validation used the same model and `TP=1, PP=2` setup with
+an 8,192-token context limit. Each prompt contains a 3,410-token shared 16-shot
+context preceded by one of eight request-local metadata prefixes. This shifts
+the shared content to different absolute positions while leaving only 1-5
+ordinary Radix prefix tokens reusable. Requests use greedy decoding at batch
+concurrency 8. GSM8K uses the first 100 test examples and a 256-token output
+limit; AIME-2024 uses all 30 examples and a 512-token output limit.
+
+Run either task with:
+
+```bash
+python benchmark/unified_pic/eval_long_math.py \
+  --base-url http://127.0.0.1:30000 \
+  --model-path /workspace/models/DeepSeek-V2-Lite-AWQ \
+  --task gsm8k --label RUN_LABEL --output RUN.json \
+  --limit 100 --num-shots 16 --concurrency 8 --max-new-tokens 256
+
+python benchmark/unified_pic/summarize_pic_log.py \
+  PIC_SERVER.log PIC_RUN.json --output PIC_COVERAGE.json
+```
+
+Observed results:
+
+| Task | Baseline | PIC observer | Delta | Prediction match | Token exact | PIC candidate coverage |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| GSM8K (100) | 30/100 | 31/100 | +1.00 pp | 85/100 | 72/100 | 312,890/392,063 (79.81%) |
+| AIME-2024 (30) | 0/30 | 0/30 | 0.00 pp | 22/30 | 20/30 | 93,731/118,652 (79.00%) |
+
+All 130 requests completed successfully and all 130 PIC requests found shifted
+content spans, with no PP-stage decision conflicts. GSM8K had one correctness
+flip, case 42, from wrong to correct; there were no correct-to-wrong flips.
+AIME's absolute score is not informative about cache quality: this Lite AWQ
+checkpoint produced no correct answers under the long-context prompt and often
+reached the generation limit. It still serves as a paired output-stability and
+concurrency stress test.
+
+The non-exact generations are not attributed to reused KV because phase 1 does
+not remap, read, or skip any live KV row. Case 42 also changes among ordinary
+baseline batch shapes (the main baseline predicted 6.75 and a single-request
+baseline replay predicted 54, both wrong), while observer replays predicted the
+correct 26. This demonstrates a batch/process-sensitive AWQ+PP2 greedy path,
+not a measured mathematical accuracy gain from PIC. The defensible phase-1
+conclusion is therefore: no accuracy regression was observed, and roughly 79%
+of long-prompt tokens are eligible for the future physical reuse path. Actual
+precision validation must be repeated once canonical `c_KV` remapping and
+delta-rotated `k_r` enter attention.
+
+The machine-readable summary is in
+`benchmark/unified_pic/results/dual_4090_long_math.json`.
+
 ## Phase 2: low-bit canonical c_KV
 
 The physical adapter will split the current `(c_KV, k_r)` row into:

@@ -33,6 +33,7 @@ def main() -> None:
                 "case_id": case_id,
                 "token_match": token_match,
                 "text_match": text_match,
+                "prediction_match": left.get("prediction") == right.get("prediction"),
                 "baseline_latency_s": left["latency_s"],
                 "pic_latency_s": right["latency_s"],
             }
@@ -41,8 +42,29 @@ def main() -> None:
         "cases": len(rows),
         "token_exact_matches": sum(row["token_match"] for row in rows),
         "text_exact_matches": sum(row["text_match"] for row in rows),
+        "prediction_matches": sum(row["prediction_match"] for row in rows),
         "rows": rows,
     }
+    if rows and all(
+        "correct" in baseline_by_id[index] and "correct" in pic_by_id[index]
+        for index in common_ids
+    ):
+        baseline_correct = sum(baseline_by_id[index]["correct"] for index in common_ids)
+        pic_correct = sum(pic_by_id[index]["correct"] for index in common_ids)
+        report.update(
+            {
+                "baseline_correct": baseline_correct,
+                "pic_correct": pic_correct,
+                "baseline_accuracy": baseline_correct / len(rows),
+                "pic_accuracy": pic_correct / len(rows),
+                "accuracy_delta": (pic_correct - baseline_correct) / len(rows),
+                "correctness_flips": [
+                    index
+                    for index in common_ids
+                    if baseline_by_id[index]["correct"] != pic_by_id[index]["correct"]
+                ],
+            }
+        )
     encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
